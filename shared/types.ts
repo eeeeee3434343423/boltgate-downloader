@@ -53,6 +53,18 @@ export interface TlsInfo {
   error?: string;
 }
 
+export interface MirrorProbeSummary {
+  url: string;
+  finalUrl: string;
+  host: string;
+  statusCode?: number;
+  totalBytes: number | null;
+  supportsRanges: boolean;
+  riskLevel: RiskLevel;
+  included: boolean;
+  excludeReason?: string;
+}
+
 export interface SafetyReport {
   riskLevel: RiskLevel;
   signals: SafetySignal[];
@@ -73,6 +85,7 @@ export interface SafetyReport {
   domainTrust: 'trusted' | 'blocked' | 'unknown';
   tls?: TlsInfo;
   duplicateOfId?: string;
+  mirrorReports?: MirrorProbeSummary[];
   probedAt: number;
   probeError?: string;
 }
@@ -85,6 +98,7 @@ export interface SegmentState {
   speedBps: number;
   status: 'pending' | 'active' | 'done' | 'paused' | 'error';
   retries: number;
+  mirrorIndex?: number;
   lastError?: string;
 }
 
@@ -92,6 +106,7 @@ export interface DownloadItem {
   id: string;
   originalUrl: string;
   finalUrl: string;
+  mirrorUrls?: string[];
   filename: string;
   destinationDir: string;
   savedPath: string;

@@ -144,3 +144,42 @@ test('probeUrl detects 405 HEAD -> 206 Range fallback, redirects, double-extensi
     await close();
   }
 });
+
+test('probeUrl probes GET Range: bytes=0-0 when HEAD returns 200 without Accept-Ranges and preserves Content-Disposition', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, {
+        'Content-Type': 'application/epub+zip',
+        'Content-Disposition': 'attachment; filename="Distributed_Systems.epub"',
+        'Content-Length': 2097152,
+      });
+      res.end();
+      return;
+    }
+    if (req.headers.range === 'bytes=0-0') {
+      res.writeHead(206, {
+        'Content-Range': 'bytes 0-0/2097152',
+        'Content-Length': 1,
+        'Accept-Ranges': 'bytes',
+      });
+      res.end(Buffer.from([0x50]));
+      return;
+    }
+    res.writeHead(200);
+    res.end();
+  });
+
+  const { port, close } = await listenServer(server);
+  try {
+    const report = await probeUrl(`http://127.0.0.1:${port}/download?id=99`, {
+      trustRules: [],
+      existingDownloads: [],
+    });
+    assert.equal(report.supportsRanges, true);
+    assert.equal(report.totalBytes, 2097152);
+    assert.equal(report.suggestedFilename, 'Distributed_Systems.epub');
+    assert.equal(report.category, 'ebook');
+  } finally {
+    await close();
+  }
+});

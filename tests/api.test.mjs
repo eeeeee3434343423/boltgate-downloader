@@ -202,3 +202,58 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
     await fs.rm(tmpDownloadDir, { recursive: true, force: true });
   }
 });
+
+test('POST /api/inspect-mirrors verifies matching mirrors, excludes mismatched sizes, and completes striped download', async () => {
+  const tmpDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-mirror-data-'));
+  const tmpDownloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-mirror-dl-'));
+
+  const manager = new DownloadManager({ dataDir: tmpDataDir });
+  await manager.init();
+  await manager.updateSettings({ downloadDir: tmpDownloadDir });
+
+  const server = createAppServer({ manager });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    const res = await jsonReq(baseUrl, '/api/inspect-mirrors', 'POST', {
+      text: [
+        `${baseUrl}/api/local-benchmark?sizeMB=2&m=1`,
+        `${baseUrl}/api/local-benchmark?sizeMB=2&m=2`,
+        `${baseUrl}/api/local-benchmark?sizeMB=3&m=bad`,
+      ].join('\n'),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.data.items.length, 1);
+    const id = res.data.items[0].id;
+
+    const reviewed = await waitFor(async () => {
+      const st = await jsonReq(baseUrl, '/api/state');
+      const item = st.data.downloads.find((d) => d.id === id);
+      return item?.status === 'pending_review' ? item : null;
+    });
+
+    assert.equal(reviewed.mirrorUrls.length, 2);
+    assert.equal(reviewed.safety.mirrorReports.length, 3);
+    assert.equal(reviewed.safety.mirrorReports[2].included, false);
+    assert.ok(reviewed.safety.mirrorReports[2].excludeReason.includes('Size mismatch'));
+
+    await jsonReq(baseUrl, `/api/downloads/${id}/approve`, 'POST', {});
+    const completed = await waitFor(async () => {
+      const st = await jsonReq(baseUrl, '/api/state');
+      const item = st.data.downloads.find((d) => d.id === id);
+      return item?.status === 'completed' ? item : null;
+    });
+
+    const diskBytes = await fs.readFile(completed.savedPath);
+    const actualHash = crypto.createHash('sha256').update(diskBytes).digest('hex');
+    assert.equal(completed.sha256, actualHash);
+    assert.equal(diskBytes.length, 2 * 1024 * 1024);
+  } finally {
+    await manager.shutdown().catch(() => {});
+    await new Promise((r) => server.close(() => r()));
+    await fs.rm(tmpDataDir, { recursive: true, force: true });
+    await fs.rm(tmpDownloadDir, { recursive: true, force: true });
+  }
+});

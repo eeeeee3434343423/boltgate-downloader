@@ -77,6 +77,12 @@ export const api = {
       body: JSON.stringify({ text, destinationDir }),
     }),
 
+  inspectMirrors: (text: string, destinationDir?: string) =>
+    requestJson<{ items: DownloadItem[]; rejectedTokens: string[] }>('/api/inspect-mirrors', {
+      method: 'POST',
+      body: JSON.stringify({ text, destinationDir }),
+    }),
+
   approveDownload: (
     id: string,
     opts: {

@@ -200,6 +200,21 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
             </section>
           )}
 
+          {item.mirrorUrls && item.mirrorUrls.length > 1 && (
+            <section>
+              <h3 style={{ margin: '0 0 8px', fontSize: 13.5 }}>
+                Active Mirrors ({item.mirrorUrls.length})
+              </h3>
+              <div className="signal-details-list" style={{ marginTop: 0 }}>
+                {item.mirrorUrls.map((mUrl, idx) => (
+                  <div key={`${mUrl}-${idx}`} className="mono" style={{ wordBreak: 'break-all' }}>
+                    M{idx + 1}: {mUrl}
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
           {item.segments.length > 0 && (
             <section>
               <h3 style={{ margin: '0 0 8px', fontSize: 13.5 }}>
@@ -222,6 +237,15 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
                       segTotal && segTotal > 0
                         ? Math.min(100, Math.round((seg.downloaded / segTotal) * 100))
                         : null;
+                    const mirrorUrl = item.mirrorUrls?.[seg.mirrorIndex ?? 0];
+                    let mirrorHost = '';
+                    if (mirrorUrl && (item.mirrorUrls?.length ?? 0) > 1) {
+                      try {
+                        mirrorHost = ` [${new URL(mirrorUrl).host}]`;
+                      } catch {
+                        mirrorHost = '';
+                      }
+                    }
                     return (
                       <tr key={seg.id}>
                         <td className="num">#{seg.id + 1}</td>
@@ -234,6 +258,7 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
                         <td className="num">{formatSpeed(seg.speedBps)}</td>
                         <td>
                           {seg.status}
+                          {mirrorHost}
                           {seg.retries > 0 ? ` (retries: ${seg.retries})` : ''}
                         </td>
                       </tr>

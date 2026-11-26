@@ -174,19 +174,24 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
     throw new Error('Redirect limit exceeded');
   };
 
+  let headHeaders: http.IncomingHttpHeaders | undefined;
+
   try {
     const headResult = await follow(initialUrl, 'HEAD', {});
     currentUrl = headResult.url;
     finalResponse = headResult.resp;
+    headHeaders = headResult.resp.headers;
 
+    const headAcceptRanges = String(finalResponse.headers['accept-ranges'] ?? '').toLowerCase();
     const needsRangeProbe =
-      finalResponse.statusCode === 405 ||
+      finalResponse.statusCode === 400 ||
       finalResponse.statusCode === 403 ||
+      finalResponse.statusCode === 405 ||
       finalResponse.statusCode === 501 ||
       (finalResponse.statusCode >= 200 &&
         finalResponse.statusCode < 300 &&
-        !finalResponse.headers['content-length'] &&
-        !finalResponse.headers['accept-ranges']);
+        !headAcceptRanges.includes('bytes') &&
+        headAcceptRanges !== 'none');
 
     if (needsRangeProbe) {
       try {
@@ -212,22 +217,24 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
 
   const headers = finalResponse?.headers ?? {};
   const statusCode = finalResponse?.statusCode;
-  const contentTypeRaw = headers['content-type'];
-  const contentType = Array.isArray(contentTypeRaw) ? contentTypeRaw[0] : contentTypeRaw;
-  const etagRaw = headers.etag;
-  const etag = Array.isArray(etagRaw) ? etagRaw[0] : etagRaw;
-  const lmRaw = headers['last-modified'];
-  const lastModified = Array.isArray(lmRaw) ? lmRaw[0] : lmRaw;
-  const cdRaw = headers['content-disposition'];
-  const contentDisposition = Array.isArray(cdRaw) ? cdRaw[0] : cdRaw;
-  const acceptRangesRaw = headers['accept-ranges'];
-  const acceptRanges = Array.isArray(acceptRangesRaw) ? acceptRangesRaw[0] : acceptRangesRaw;
+  const contentType = firstStr(headers['content-type']) ?? firstStr(headHeaders?.['content-type']);
+  const etag = firstStr(headers.etag) ?? firstStr(headHeaders?.etag);
+  const lastModified =
+    firstStr(headers['last-modified']) ?? firstStr(headHeaders?.['last-modified']);
+  const contentDisposition =
+    firstStr(headers['content-disposition']) ?? firstStr(headHeaders?.['content-disposition']);
+  const acceptRanges =
+    firstStr(headers['accept-ranges']) ?? firstStr(headHeaders?.['accept-ranges']);
 
   let totalBytes: number | null = null;
   if (statusCode === 206) {
-    totalBytes = parseContentRangeTotal(headers['content-range']);
+    totalBytes =
+      parseContentRangeTotal(headers['content-range']) ??
+      parseContentLength(headHeaders?.['content-length']);
   } else if (statusCode && statusCode >= 200 && statusCode < 300) {
-    totalBytes = parseContentLength(headers['content-length']);
+    totalBytes =
+      parseContentLength(headers['content-length']) ??
+      parseContentLength(headHeaders?.['content-length']);
   }
 
   const supportsRanges =

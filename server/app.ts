@@ -130,6 +130,25 @@ async function handleApiRequest(
     return;
   }
 
+  if (p === '/api/inspect-mirrors' && method === 'POST') {
+    const body = await readJsonBody<{ text?: string; destinationDir?: string }>(req);
+    const rawText = body.text ?? '';
+    if (!rawText.trim()) {
+      sendJson(res, 400, { error: 'Paste mirror links for the same file to inspect' });
+      return;
+    }
+    const result = await manager.inspectMirrorGroup(rawText, body.destinationDir);
+    if (result.items.length === 0) {
+      sendJson(res, 400, {
+        error: 'No valid http:// or https:// URLs detected',
+        rejectedTokens: result.rejectedTokens,
+      });
+      return;
+    }
+    sendJson(res, 200, result);
+    return;
+  }
+
   if (p === '/api/downloads/approve-batch' && method === 'POST') {
     const body = await readJsonBody<{ ids?: string[]; trustDomains?: boolean }>(req);
     const items = await manager.approveBatch(body.ids ?? [], Boolean(body.trustDomains));

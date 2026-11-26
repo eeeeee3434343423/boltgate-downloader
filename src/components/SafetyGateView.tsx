@@ -213,6 +213,23 @@ export function SafetyGateView({
                   <div className="url-trace mono" title={safety.finalUrl}>
                     {safety.finalUrl}
                   </div>
+                  {safety.mirrorReports && safety.mirrorReports.length > 1 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                      <span className="badge badge-info">
+                        {safety.mirrorReports.filter((m) => m.included).length} /{' '}
+                        {safety.mirrorReports.length} Mirrors Verified
+                      </span>
+                      {safety.mirrorReports.map((m, idx) => (
+                        <span
+                          key={`${m.url}-${idx}`}
+                          className={`badge ${m.included ? 'badge-ok' : 'badge-warn'}`}
+                          title={m.excludeReason ?? `Verified ${formatBytes(m.totalBytes)}`}
+                        >
+                          {m.host}: {m.included ? 'Active Mirror' : m.excludeReason ?? 'Excluded'}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <button

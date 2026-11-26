@@ -10,6 +10,8 @@ import type {
   DiskSpaceInfo,
   DownloadItem,
   FileIntegrityReport,
+  MirrorProbeSummary,
+  RiskLevel,
   SSEEvent,
   SpeedPreset,
   TrustRule,
@@ -217,6 +219,212 @@ export class DownloadManager {
     }
 
     return { items: created, rejectedTokens };
+  }
+
+  async inspectMirrorGroup(
+    rawText: string,
+    destinationDir?: string
+  ): Promise<{ items: DownloadItem[]; rejectedTokens: string[] }> {
+    const { urls, rejectedTokens } = extractUrlsFromText(rawText);
+    if (urls.length < 2) {
+      return this.inspectRawText(rawText, destinationDir);
+    }
+
+    const baseDest = destinationDir?.trim()
+      ? path.resolve(destinationDir.trim())
+      : this.settings.downloadDir;
+
+    const primaryUrl = urls[0]!;
+    const parsed = new URL(primaryUrl);
+    const roughName = sanitizeFilename(
+      decodeURIComponentSafe(parsed.pathname.split('/').filter(Boolean).pop() ?? '') ||
+        parsed.hostname ||
+        'download'
+    );
+
+    const item: DownloadItem = {
+      id: crypto.randomUUID(),
+      originalUrl: primaryUrl,
+      finalUrl: primaryUrl,
+      mirrorUrls: urls,
+      filename: roughName,
+      destinationDir: baseDest,
+      savedPath: path.join(baseDest, roughName),
+      partPath: path.join(baseDest, `${roughName}.boltpart`),
+      category: classifyFile(roughName).category,
+      status: 'probing',
+      priority: this.nextPriority(),
+      totalBytes: null,
+      downloadedBytes: 0,
+      speedBps: 0,
+      avgSpeedBps: 0,
+      etaSeconds: null,
+      connections: Math.min(16, Math.max(this.settings.segmentsPerDownload, urls.length * 4)),
+      supportsRanges: false,
+      segments: [],
+      safety: null,
+      createdAt: Date.now(),
+      userDeemedSafe: false,
+    };
+
+    this.downloads.unshift(item);
+    this.broadcast({ type: 'download_updated', data: item });
+    this.persistImmediate();
+
+    void this.runMirrorGroupProbe(item, urls, destinationDir);
+    return { items: [item], rejectedTokens };
+  }
+
+  private async runMirrorGroupProbe(
+    item: DownloadItem,
+    mirrorUrls: string[],
+    customDest?: string
+  ): Promise<void> {
+    await this.refreshDiskSpace();
+    const existing = this.downloads.filter((d) => d.id !== item.id);
+    const reports = await Promise.all(
+      mirrorUrls.map((u) =>
+        probeUrl(u, {
+          trustRules: this.trustRules,
+          existingDownloads: existing,
+          freeBytes: this.diskSpace.freeBytes || undefined,
+        })
+      )
+    );
+
+    const current = this.downloads.find((d) => d.id === item.id);
+    if (!current) return;
+
+    const primary =
+      reports.find(
+        (r) =>
+          !r.probeError &&
+          (r.statusCode ?? 500) < 400 &&
+          r.supportsRanges &&
+          r.totalBytes !== null &&
+          r.domainTrust !== 'blocked'
+      ) ??
+      reports.find((r) => !r.probeError && (r.statusCode ?? 500) < 400) ??
+      reports[0]!;
+
+    const mirrorReports: MirrorProbeSummary[] = [];
+    const includedUrls: string[] = [];
+    const seenFinal = new Set<string>();
+    const includedReports = [primary];
+
+    for (let i = 0; i < reports.length; i++) {
+      const r = reports[i]!;
+      const rawUrl = mirrorUrls[i]!;
+      let included = true;
+      let excludeReason: string | undefined;
+
+      if (r.probeError || (r.statusCode ?? 500) >= 400) {
+        included = false;
+        excludeReason = r.probeError ?? `HTTP ${r.statusCode}`;
+      } else if (r.domainTrust === 'blocked') {
+        included = false;
+        excludeReason = 'Blocked domain';
+      } else if (!primary.supportsRanges || primary.totalBytes === null) {
+        included = r === primary;
+        if (!included) excludeReason = 'Primary mirror does not support byte ranges or size';
+      } else if (!r.supportsRanges) {
+        included = false;
+        excludeReason = 'No byte-range support';
+      } else if (r.totalBytes === null || r.totalBytes !== primary.totalBytes) {
+        included = false;
+        excludeReason = `Size mismatch (${r.totalBytes ?? 'unknown'} vs ${primary.totalBytes} bytes)`;
+      } else if (seenFinal.has(r.finalUrl)) {
+        included = false;
+        excludeReason = 'Duplicate mirror endpoint';
+      }
+
+      if (included) {
+        seenFinal.add(r.finalUrl);
+        includedUrls.push(r.finalUrl);
+        if (r !== primary) includedReports.push(r);
+      }
+
+      mirrorReports.push({
+        url: rawUrl,
+        finalUrl: r.finalUrl,
+        host: r.finalHost,
+        statusCode: r.statusCode,
+        totalBytes: r.totalBytes,
+        supportsRanges: r.supportsRanges,
+        riskLevel: r.riskLevel,
+        included,
+        excludeReason,
+      });
+    }
+
+    const signals = [...primary.signals];
+    if (includedUrls.length >= 2) {
+      signals.unshift({
+        id: 'multi_mirror',
+        level: 'ok',
+        title: `Multi-Mirror Striped Ready (${includedUrls.length} mirrors)`,
+        detail: `Verified identical ${primary.totalBytes?.toLocaleString()} byte size and Range support across ${includedUrls.length} mirrors.`,
+      });
+    }
+    const excludedMirrors = mirrorReports.filter((m) => !m.included);
+    if (excludedMirrors.length > 0) {
+      signals.push({
+        id: 'mirror_excluded',
+        level: 'warn',
+        title: `${excludedMirrors.length} Mirror(s) Excluded`,
+        detail: excludedMirrors
+          .map((m) => `${m.host}: ${m.excludeReason ?? 'incompatible'}`)
+          .join('; '),
+      });
+    }
+
+    const riskOrder: Record<RiskLevel, number> = {
+      safe: 0,
+      caution: 1,
+      high_risk: 2,
+      error: 3,
+    };
+    let worstRisk = primary.riskLevel;
+    for (const ir of includedReports) {
+      if (riskOrder[ir.riskLevel] > riskOrder[worstRisk]) {
+        worstRisk = ir.riskLevel;
+      }
+    }
+
+    current.safety = {
+      ...primary,
+      riskLevel: worstRisk,
+      signals,
+      mirrorReports,
+    };
+    current.finalUrl = primary.finalUrl;
+    current.mirrorUrls = includedUrls.length > 0 ? includedUrls : [primary.finalUrl];
+    current.filename = primary.suggestedFilename;
+    current.category = primary.category;
+    current.totalBytes = primary.totalBytes;
+    current.supportsRanges = primary.supportsRanges;
+    current.etag = primary.etag;
+    current.lastModified = primary.lastModified;
+    current.connections =
+      current.mirrorUrls.length >= 2
+        ? Math.min(16, Math.max(this.settings.segmentsPerDownload, current.mirrorUrls.length * 4))
+        : this.settings.segmentsPerDownload;
+
+    const effectiveDest = customDest?.trim()
+      ? path.resolve(customDest.trim())
+      : this.settings.organizeByCategory
+        ? path.join(this.settings.downloadDir, primary.category)
+        : this.settings.downloadDir;
+
+    current.destinationDir = effectiveDest;
+    const unique = await resolveUniquePath(effectiveDest, current.filename);
+    current.filename = unique.filename;
+    current.savedPath = unique.savedPath;
+    current.partPath = unique.partPath;
+    current.status = 'pending_review';
+
+    this.broadcast({ type: 'download_updated', data: current });
+    this.persistImmediate();
   }
 
   private async runProbeForItem(item: DownloadItem, customDest?: string): Promise<void> {

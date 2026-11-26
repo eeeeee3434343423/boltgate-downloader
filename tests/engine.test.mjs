@@ -314,3 +314,105 @@ test('DownloadRunner respects HTTP 429 Retry-After header and finishes cleanly',
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('DownloadRunner stripes across fast & slow mirrors, fails over on 429, and defaults to 128 KiB ebook segments', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-eng-mirrors-'));
+  const { buf: payload, sha256: expectedHash } = makeDeterministicPayload(1536 * 1024); // 1.5 MiB
+
+  let mirrorAHits = 0;
+  let mirrorBHits = 0;
+
+  // Mirror A: slow mirror
+  const serverA = http.createServer(async (req, res) => {
+    mirrorAHits++;
+    const range = req.headers.range;
+    const [, s, e] = range.match(/^bytes=(\d+)-(\d*)$/);
+    const start = Number(s);
+    const end = e ? Number(e) : payload.length - 1;
+    const slice = payload.subarray(start, end + 1);
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${payload.length}`,
+      'Content-Length': slice.length,
+      'Accept-Ranges': 'bytes',
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    if (!res.destroyed) res.end(slice);
+  });
+
+  // Mirror B: fast mirror
+  const serverB = http.createServer((req, res) => {
+    mirrorBHits++;
+    const range = req.headers.range;
+    const [, s, e] = range.match(/^bytes=(\d+)-(\d*)$/);
+    const start = Number(s);
+    const end = e ? Number(e) : payload.length - 1;
+    const slice = payload.subarray(start, end + 1);
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${payload.length}`,
+      'Content-Length': slice.length,
+      'Accept-Ranges': 'bytes',
+    });
+    res.end(slice);
+  });
+
+  // Mirror C: always returns 429 Retry-After: 30
+  const serverC = http.createServer((req, res) => {
+    res.writeHead(429, { 'Retry-After': '30' });
+    res.end('Slow down');
+  });
+
+  const a = await listenServer(serverA);
+  const b = await listenServer(serverB);
+  const c = await listenServer(serverC);
+
+  try {
+    // 1. Default 128 KiB segmenting + multi-mirror striping
+    const item = makeItem(`http://127.0.0.1:${a.port}/ebook.epub`, tmpDir, 'ebook.epub', {
+      totalBytes: payload.length,
+      connections: 8,
+      supportsRanges: true,
+    });
+    item.mirrorUrls = [
+      `http://127.0.0.1:${a.port}/ebook.epub`,
+      `http://127.0.0.1:${b.port}/ebook.epub`,
+    ];
+
+    await new DownloadRunner({
+      item,
+      throttle: new TokenBucketThrottle(0),
+      onUpdate: () => {},
+    }).run();
+
+    assert.equal(item.status, 'completed');
+    assert.equal(item.sha256, expectedHash);
+    assert.ok(item.segments.length >= 8, `Expected >=8 segments for 1.5 MiB file, got ${item.segments.length}`);
+    assert.ok(mirrorAHits > 0 && mirrorBHits > 0, 'Expected both mirrors to serve ranges');
+
+    // 2. Immediate failover when one mirror returns 429 Retry-After: 30
+    const failoverItem = makeItem(`http://127.0.0.1:${c.port}/book2.epub`, tmpDir, 'book2.epub', {
+      totalBytes: payload.length,
+      connections: 4,
+      supportsRanges: true,
+    });
+    failoverItem.mirrorUrls = [
+      `http://127.0.0.1:${c.port}/book2.epub`,
+      `http://127.0.0.1:${b.port}/book2.epub`,
+    ];
+
+    const startFailover = Date.now();
+    await new DownloadRunner({
+      item: failoverItem,
+      throttle: new TokenBucketThrottle(0),
+      onUpdate: () => {},
+    }).run();
+
+    assert.equal(failoverItem.status, 'completed');
+    assert.equal(failoverItem.sha256, expectedHash);
+    assert.ok(Date.now() - startFailover < 3000, 'Expected instant failover instead of waiting 30s');
+  } finally {
+    await a.close();
+    await b.close();
+    await c.close();
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

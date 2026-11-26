@@ -222,6 +222,11 @@ export function DownloadsView({
                             : item.status[0]!.toUpperCase() + item.status.slice(1)}
                       </span>
                       <span className="badge">{categoryLabel(item.category)}</span>
+                      {item.mirrorUrls && item.mirrorUrls.length > 1 && (
+                        <span className="badge badge-info num">
+                          {item.mirrorUrls.length} mirrors
+                        </span>
+                      )}
                     </div>
 
                     <div className="meta-line num">
@@ -363,6 +368,21 @@ export function DownloadsView({
                     </div>
                   )}
                 </div>
+
+                {item.status === 'downloading' &&
+                  item.startedAt &&
+                  Date.now() - item.startedAt > 4000 &&
+                  item.speedBps > 0 &&
+                  item.speedBps < 512 * 1024 && (
+                    <div
+                      className="badge badge-warn"
+                      style={{ marginTop: 8, borderRadius: 8, padding: '6px 10px', whiteSpace: 'normal' }}
+                    >
+                      {!item.supportsRanges
+                        ? 'Host disabled byte-range acceleration (single stream) — transfer speed is capped by the remote server.'
+                        : `Remote mirror is serving at ${formatSpeed(item.speedBps)} across ${activeStreams} stream(s) (likely server-side bandwidth cap). Combine alternate direct mirrors in Bulk Paste or try a faster mirror for MB/s speeds.`}
+                    </div>
+                  )}
 
                 {item.error && (
                   <div

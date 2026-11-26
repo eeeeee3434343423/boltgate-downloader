@@ -153,6 +153,21 @@ export function App() {
     [showToast]
   );
 
+  const handleInspectMirrors = useCallback(
+    async (text: string, destinationDir?: string) => {
+      const res = await api.inspectMirrors(text, destinationDir);
+      if (res.items.length > 0) {
+        setActiveTab('gate');
+      }
+      if (res.rejectedTokens.length > 0) {
+        showToast(
+          `Inspected mirror group; skipped ${res.rejectedTokens.length} unsupported scheme(s).`
+        );
+      }
+    },
+    [showToast]
+  );
+
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -348,6 +363,7 @@ export function App() {
         <PasteBar
           defaultDest={state.settings.downloadDir}
           onInspect={handleInspect}
+          onInspectMirrors={handleInspectMirrors}
           inputRef={pasteInputRef}
         />
 

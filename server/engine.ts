@@ -29,7 +29,16 @@ class RetryableHttpError extends Error {
   }
 }
 
-const DEFAULT_MIN_SEGMENT_BYTES = 1 * 1024 * 1024; // 1 MiB
+interface MirrorMetric {
+  url: string;
+  bytes: number;
+  speedBps: number;
+  lastSampleBytes: number;
+  cooldownUntil: number;
+  failures: number;
+}
+
+const DEFAULT_MIN_SEGMENT_BYTES = 128 * 1024; // 128 KiB (enables 8-16 parallel streams on 1-10 MB ebooks)
 const DEFAULT_STALL_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RETRIES = 5;
 const MAX_REDIRECTS = 10;
@@ -59,6 +68,7 @@ export class DownloadRunner {
   private lastSampleBytes = 0;
   private segLastSampleBytes = new Map<number, number>();
   private emaSpeedBps = 0;
+  private mirrorMetrics: MirrorMetric[] = [];
 
   constructor(options: RunnerOptions) {
     this.item = options.item;
@@ -133,6 +143,18 @@ export class DownloadRunner {
 
       this.lastSampleTime = Date.now();
       this.lastSampleBytes = this.item.downloadedBytes;
+      const activeMirrors =
+        this.item.mirrorUrls && this.item.mirrorUrls.length > 0
+          ? this.item.mirrorUrls
+          : [this.item.finalUrl];
+      this.mirrorMetrics = activeMirrors.map((url) => ({
+        url,
+        bytes: 0,
+        speedBps: 0,
+        lastSampleBytes: 0,
+        cooldownUntil: 0,
+        failures: 0,
+      }));
       for (const seg of this.item.segments) {
         this.segLastSampleBytes.set(seg.id, seg.downloaded);
       }
@@ -264,6 +286,7 @@ export class DownloadRunner {
   private buildInitialSegments(): SegmentState[] {
     const total = this.item.totalBytes;
     const requested = Math.max(1, Math.min(16, this.item.connections || 1));
+    const mirrorCount = Math.max(1, this.item.mirrorUrls?.length || this.mirrorMetrics.length || 1);
 
     if (!this.item.supportsRanges || total === null || total < this.minSegmentBytes * 2 || requested === 1) {
       return [
@@ -275,6 +298,7 @@ export class DownloadRunner {
           speedBps: 0,
           status: 'pending',
           retries: 0,
+          mirrorIndex: 0,
         },
       ];
     }
@@ -295,6 +319,7 @@ export class DownloadRunner {
         speedBps: 0,
         status: 'pending',
         retries: 0,
+        mirrorIndex: i % mirrorCount,
       });
     }
     return segments;
@@ -351,6 +376,22 @@ export class DownloadRunner {
         }
         seg.retries += 1;
         seg.lastError = err instanceof Error ? err.message : String(err);
+
+        const failedMirrorIdx = seg.mirrorIndex ?? 0;
+        const failedMetric = this.mirrorMetrics[failedMirrorIdx];
+        if (failedMetric) {
+          failedMetric.failures += 1;
+          failedMetric.cooldownUntil =
+            Date.now() + (err instanceof RetryableHttpError ? err.retryAfterMs : 2_000);
+        }
+
+        const altIdx = this.pickHealthyAlternateMirror(failedMirrorIdx);
+        if (altIdx !== null && seg.retries <= this.maxRetries + this.mirrorMetrics.length) {
+          seg.mirrorIndex = altIdx;
+          await abortableDelay(50, this.abortController.signal).catch(() => {});
+          continue;
+        }
+
         if (seg.retries > this.maxRetries) {
           seg.status = 'error';
           seg.speedBps = 0;
@@ -385,8 +426,11 @@ export class DownloadRunner {
       }
     }
 
+    const mirrorIdx = seg.mirrorIndex ?? 0;
+    const targetUrl = this.mirrorMetrics[mirrorIdx]?.url ?? this.item.finalUrl;
+
     const { res, req } = await this.openStreamWithRedirects(
-      this.item.finalUrl,
+      targetUrl,
       headers,
       workerEpoch
     );
@@ -424,6 +468,17 @@ export class DownloadRunner {
         this.item.connections = 1;
         this.item.totalBytes = total;
         this.item.downloadedBytes = 0;
+        this.item.mirrorUrls = [targetUrl];
+        this.mirrorMetrics = [
+          {
+            url: targetUrl,
+            bytes: 0,
+            speedBps: 0,
+            lastSampleBytes: 0,
+            cooldownUntil: 0,
+            failures: 0,
+          },
+        ];
 
         if (this.fileHandle) {
           await this.fileHandle.truncate(total && total > 0 ? total : 0);
@@ -437,12 +492,13 @@ export class DownloadRunner {
           speedBps: 0,
           status: 'active',
           retries: 0,
+          mirrorIndex: 0,
         };
         this.item.segments = [singleSeg];
         this.segLastSampleBytes.clear();
         this.segLastSampleBytes.set(0, 0);
 
-        await this.streamResponseIntoSegment(singleSeg, res, newEpoch);
+        await this.streamResponseIntoSegment(singleSeg, res, newEpoch, 0);
         return { switchedEpoch: newEpoch };
       }
 
@@ -469,7 +525,7 @@ export class DownloadRunner {
         }
       }
 
-      await this.streamResponseIntoSegment(seg, res, workerEpoch);
+      await this.streamResponseIntoSegment(seg, res, workerEpoch, mirrorIdx);
       return {};
     } finally {
       this.activeRequests.delete(req);
@@ -482,7 +538,8 @@ export class DownloadRunner {
   private async streamResponseIntoSegment(
     seg: SegmentState,
     res: http.IncomingMessage,
-    workerEpoch: number
+    workerEpoch: number,
+    mirrorIdx = 0
   ): Promise<void> {
     let stallTimer: NodeJS.Timeout | null = null;
     const resetStall = () => {
@@ -546,6 +603,9 @@ export class DownloadRunner {
         const writeOffset = seg.start + seg.downloaded;
         seg.downloaded += slice.length;
         this.item.downloadedBytes += slice.length;
+        if (this.mirrorMetrics[mirrorIdx]) {
+          this.mirrorMetrics[mirrorIdx]!.bytes += slice.length;
+        }
 
         const writePromise = this.fileHandle.write(slice, 0, slice.length, writeOffset);
         this.inFlightWrites.add(writePromise);
@@ -606,10 +666,47 @@ export class DownloadRunner {
       speedBps: 0,
       status: 'pending',
       retries: 0,
+      mirrorIndex: this.pickFastestMirrorIndex(bestDonor.mirrorIndex),
     };
     this.item.segments.push(stolen);
     this.segLastSampleBytes.set(stolen.id, 0);
     this.spawnWorker(stolen, workerEpoch);
+  }
+
+  private pickHealthyAlternateMirror(excludeIdx: number): number | null {
+    if (this.mirrorMetrics.length <= 1) return null;
+    const now = Date.now();
+    let bestIdx: number | null = null;
+    let bestScore = -1;
+
+    for (let i = 0; i < this.mirrorMetrics.length; i++) {
+      if (i === excludeIdx) continue;
+      const m = this.mirrorMetrics[i]!;
+      if (m.cooldownUntil > now) continue;
+      const score = m.speedBps * 10 - m.failures;
+      if (bestIdx === null || score > bestScore) {
+        bestIdx = i;
+        bestScore = score;
+      }
+    }
+    return bestIdx;
+  }
+
+  private pickFastestMirrorIndex(fallbackIdx = 0): number {
+    if (this.mirrorMetrics.length <= 1) return 0;
+    const now = Date.now();
+    let bestIdx = fallbackIdx;
+    let bestSpeed = -1;
+
+    for (let i = 0; i < this.mirrorMetrics.length; i++) {
+      const m = this.mirrorMetrics[i]!;
+      if (m.cooldownUntil > now) continue;
+      if (m.speedBps > bestSpeed) {
+        bestSpeed = m.speedBps;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
   }
 
   private openStreamWithRedirects(
@@ -726,6 +823,12 @@ export class DownloadRunner {
         const segDelta = Math.max(0, seg.downloaded - prev);
         seg.speedBps = seg.status === 'active' ? Math.round(segDelta / dtSec) : 0;
         this.segLastSampleBytes.set(seg.id, seg.downloaded);
+      }
+
+      for (const m of this.mirrorMetrics) {
+        const mDelta = Math.max(0, m.bytes - m.lastSampleBytes);
+        m.speedBps = Math.round(mDelta / dtSec);
+        m.lastSampleBytes = m.bytes;
       }
 
       if (this.item.totalBytes !== null && this.item.speedBps > 0) {

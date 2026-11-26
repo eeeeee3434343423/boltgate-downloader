@@ -4,10 +4,11 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 interface PasteBarProps {
   defaultDest: string;
   onInspect: (text: string, destinationDir?: string) => Promise<void>;
+  onInspectMirrors?: (text: string, destinationDir?: string) => Promise<void>;
   inputRef: React.RefObject<HTMLInputElement | null>;
 }
 
-export function PasteBar({ defaultDest, onInspect, inputRef }: PasteBarProps) {
+export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }: PasteBarProps) {
   const [urlText, setUrlText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -15,6 +16,7 @@ export function PasteBar({ defaultDest, onInspect, inputRef }: PasteBarProps) {
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkText, setBulkText] = useState('');
   const [bulkDest, setBulkDest] = useState('');
+  const [bulkMode, setBulkMode] = useState<'separate' | 'mirrors'>('separate');
   const bulkTriggerRef = useRef<HTMLButtonElement | null>(null);
   const bulkTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -61,9 +63,15 @@ export function PasteBar({ defaultDest, onInspect, inputRef }: PasteBarProps) {
     setSubmitting(true);
     setErrorMsg(null);
     try {
-      await onInspect(bulkText, bulkDest.trim() || undefined);
+      const dest = bulkDest.trim() || undefined;
+      if (bulkMode === 'mirrors' && detectedBulkCount >= 2 && onInspectMirrors) {
+        await onInspectMirrors(bulkText, dest);
+      } else {
+        await onInspect(bulkText, dest);
+      }
       setBulkText('');
       setBulkDest('');
+      setBulkMode('separate');
       setBulkOpen(false);
       bulkTriggerRef.current?.focus();
     } catch (err) {
@@ -179,6 +187,46 @@ export function PasteBar({ defaultDest, onInspect, inputRef }: PasteBarProps) {
                   />
                 </div>
 
+                {detectedBulkCount >= 2 && onInspectMirrors && (
+                  <div className="field">
+                    <span id="bulk-mode-label" className="field-label">
+                      How should these {detectedBulkCount} links download?
+                    </span>
+                    <div
+                      className="pill-tabs"
+                      role="radiogroup"
+                      aria-labelledby="bulk-mode-label"
+                      style={{ width: '100%' }}
+                    >
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={bulkMode === 'separate'}
+                        className={`pill-tab ${bulkMode === 'separate' ? 'active' : ''}`}
+                        style={{ flex: 1 }}
+                        onClick={() => setBulkMode('separate')}
+                      >
+                        Separate Files (Queue Each)
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={bulkMode === 'mirrors'}
+                        className={`pill-tab ${bulkMode === 'mirrors' ? 'active' : ''}`}
+                        style={{ flex: 1 }}
+                        onClick={() => setBulkMode('mirrors')}
+                      >
+                        Same File — Combine Mirrors for Speed
+                      </button>
+                    </div>
+                    <span className="field-help">
+                      {bulkMode === 'mirrors'
+                        ? 'Verifies matching file sizes across mirrors and stripes parallel byte ranges across all healthy hosts simultaneously.'
+                        : 'Inspects and downloads each URL as its own file using polite per-host queue limits.'}
+                    </span>
+                  </div>
+                )}
+
                 <div className="field">
                   <label htmlFor="bulk-dest-input" className="field-label">
                     Destination Folder Override (optional)
@@ -210,7 +258,9 @@ export function PasteBar({ defaultDest, onInspect, inputRef }: PasteBarProps) {
                   className="btn btn-primary"
                   disabled={submitting || detectedBulkCount === 0}
                 >
-                  Inspect {detectedBulkCount || ''} Link{detectedBulkCount === 1 ? '' : 's'}
+                  {bulkMode === 'mirrors' && detectedBulkCount >= 2
+                    ? `Combine ${detectedBulkCount} Mirrors`
+                    : `Inspect ${detectedBulkCount || ''} Link${detectedBulkCount === 1 ? '' : 's'}`}
                 </button>
               </div>
             </form>
