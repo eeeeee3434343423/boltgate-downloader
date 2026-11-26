@@ -1,0 +1,7 @@
+node_modules/
+dist/
+dist-server/
+data/
+*.boltpart
+.DS_Store
+Thumbs.db

@@ -1,0 +1,382 @@
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpToLine,
+  Download,
+  Eye,
+  Pause,
+  Play,
+  RotateCcw,
+  Trash2,
+} from 'lucide-react';
+import { useMemo, useState } from 'react';
+import type { DownloadItem, FileCategory } from '../../shared/types';
+import { categoryLabel, formatBytes, formatEta, formatSpeed } from '../utils/format';
+
+interface DownloadsViewProps {
+  items: DownloadItem[];
+  onPause: (id: string) => Promise<void>;
+  onResume: (id: string, startNow?: boolean) => Promise<void>;
+  onPriority: (id: string, action: 'top' | 'up' | 'down') => Promise<void>;
+  onRemove: (id: string, deleteFile: boolean) => Promise<void>;
+  onBulkAction: (action: 'pauseAll' | 'resumeAll' | 'retryFailed') => Promise<void>;
+  onInspectDrawer: (item: DownloadItem) => void;
+  onGoToGate: () => void;
+}
+
+type StatusFilter = 'all' | 'active' | 'queued' | 'paused' | 'failed';
+
+export function DownloadsView({
+  items,
+  onPause,
+  onResume,
+  onPriority,
+  onRemove,
+  onBulkAction,
+  onInspectDrawer,
+  onGoToGate,
+}: DownloadsViewProps) {
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [categoryFilter, setCategoryFilter] = useState<'all' | FileCategory>('all');
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return items
+      .filter((item) => {
+        if (statusFilter === 'active' && item.status !== 'downloading' && item.status !== 'verifying') {
+          return false;
+        }
+        if (statusFilter !== 'all' && statusFilter !== 'active' && item.status !== statusFilter) {
+          return false;
+        }
+        if (categoryFilter !== 'all' && item.category !== categoryFilter) {
+          return false;
+        }
+        if (q && !item.filename.toLowerCase().includes(q) && !item.finalUrl.toLowerCase().includes(q)) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const rank = (s: DownloadItem['status']) =>
+          s === 'downloading' || s === 'verifying' ? 0 : s === 'queued' ? 1 : s === 'paused' ? 2 : 3;
+        const dr = rank(a.status) - rank(b.status);
+        return dr !== 0 ? dr : a.priority - b.priority;
+      });
+  }, [items, search, statusFilter, categoryFilter]);
+
+  const hasActive = items.some((i) => i.status === 'downloading' || i.status === 'queued');
+  const hasPaused = items.some((i) => i.status === 'paused');
+  const hasFailed = items.some((i) => i.status === 'failed');
+
+  return (
+    <section aria-labelledby="downloads-heading">
+      <div className="view-header">
+        <div>
+          <h1 id="downloads-heading" className="view-title">
+            Downloads ({items.length})
+          </h1>
+          <p className="view-subtitle">
+            Multi-segment parallel transfers with pause/resume, priority queueing, and work-stealing.
+          </p>
+        </div>
+
+        {items.length > 0 && (
+          <div className="toolbar-group">
+            {hasActive && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void onBulkAction('pauseAll')}
+              >
+                <Pause size={14} aria-hidden="true" />
+                Pause All
+              </button>
+            )}
+            {hasPaused && (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => void onBulkAction('resumeAll')}
+              >
+                <Play size={14} aria-hidden="true" />
+                Resume All
+              </button>
+            )}
+            {hasFailed && (
+              <button
+                type="button"
+                className="btn btn-sm btn-warn"
+                onClick={() => void onBulkAction('retryFailed')}
+              >
+                <RotateCcw size={14} aria-hidden="true" />
+                Retry Failed
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {items.length > 0 && (
+        <div className="toolbar">
+          <div className="toolbar-group">
+            <label htmlFor="dl-search" className="sr-only">
+              Search active downloads
+            </label>
+            <input
+              id="dl-search"
+              type="search"
+              className="input"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Filter filename or URL…"
+            />
+
+            <label htmlFor="dl-cat-filter" className="sr-only">
+              Filter by category
+            </label>
+            <select
+              id="dl-cat-filter"
+              className="select"
+              value={categoryFilter}
+              onChange={(e) => setCategoryFilter(e.target.value as 'all' | FileCategory)}
+            >
+              <option value="all">All categories</option>
+              <option value="ebook">Ebook</option>
+              <option value="video">Video</option>
+              <option value="audio">Audio</option>
+              <option value="archive">Archive</option>
+              <option value="disk">Disk Image</option>
+              <option value="software">Software</option>
+              <option value="document">Document</option>
+              <option value="image">Image</option>
+              <option value="other">Other</option>
+            </select>
+          </div>
+
+          <div className="pill-tabs" role="group" aria-label="Status filter">
+            {(['all', 'active', 'queued', 'paused', 'failed'] as StatusFilter[]).map((st) => (
+              <button
+                key={st}
+                type="button"
+                className={`pill-tab ${statusFilter === st ? 'active' : ''}`}
+                onClick={() => setStatusFilter(st)}
+              >
+                {st[0]!.toUpperCase() + st.slice(1)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <div className="card empty-card">
+          <div className="empty-icon">
+            <Download size={24} aria-hidden="true" />
+          </div>
+          <h2 style={{ margin: 0, fontSize: 17 }}>No active or queued downloads</h2>
+          <p style={{ margin: 0, maxWidth: 440, color: 'var(--text-muted)' }}>
+            Paste a link above or approve pending items in the Safety Gate to start multi-stream downloading.
+          </p>
+          <button type="button" className="btn btn-primary" onClick={onGoToGate}>
+            Open Safety Gate
+          </button>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="card empty-card">
+          <p style={{ margin: 0, color: 'var(--text-muted)' }}>No downloads match your current filters.</p>
+        </div>
+      ) : (
+        <div className="card-stack">
+          {filtered.map((item) => {
+            const pct =
+              item.totalBytes && item.totalBytes > 0
+                ? Math.min(100, Math.round((item.downloadedBytes / item.totalBytes) * 100))
+                : 0;
+            const activeStreams = item.segments.filter((s) => s.status === 'active').length;
+
+            return (
+              <article key={item.id} className="card">
+                <div className="card-top">
+                  <div className="card-title-group">
+                    <div className="filename-row">
+                      <span className="item-title">{item.filename}</span>
+                      <span
+                        className={`badge ${
+                          item.status === 'downloading'
+                            ? 'badge-info'
+                            : item.status === 'verifying'
+                              ? 'badge-ok'
+                              : item.status === 'paused'
+                                ? 'badge-warn'
+                                : item.status === 'failed'
+                                  ? 'badge-danger'
+                                  : ''
+                        }`}
+                      >
+                        {item.status === 'verifying'
+                          ? 'Verifying SHA-256'
+                          : item.status === 'downloading'
+                            ? `Downloading (${activeStreams} stream${activeStreams === 1 ? '' : 's'})`
+                            : item.status[0]!.toUpperCase() + item.status.slice(1)}
+                      </span>
+                      <span className="badge">{categoryLabel(item.category)}</span>
+                    </div>
+
+                    <div className="meta-line num">
+                      <span>
+                        {formatBytes(item.downloadedBytes)} / {formatBytes(item.totalBytes)} ({pct}%)
+                      </span>
+                      {item.status === 'downloading' && (
+                        <>
+                          <span>•</span>
+                          <strong style={{ color: 'var(--accent-text)' }}>
+                            {formatSpeed(item.speedBps)}
+                          </strong>
+                          <span>•</span>
+                          <span>ETA {formatEta(item.etaSeconds)}</span>
+                        </>
+                      )}
+                      <span>•</span>
+                      <span className="mono">{item.safety?.finalHost ?? new URL(item.finalUrl).hostname}</span>
+                    </div>
+                  </div>
+
+                  <div className="action-group">
+                    {(item.status === 'downloading' || item.status === 'queued') && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => void onPause(item.id)}
+                      >
+                        <Pause size={14} aria-hidden="true" />
+                        Pause
+                      </button>
+                    )}
+
+                    {(item.status === 'paused' || item.status === 'failed') && (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        onClick={() => void onResume(item.id)}
+                      >
+                        {item.status === 'failed' ? (
+                          <>
+                            <RotateCcw size={14} aria-hidden="true" /> Retry
+                          </>
+                        ) : (
+                          <>
+                            <Play size={14} aria-hidden="true" /> Resume
+                          </>
+                        )}
+                      </button>
+                    )}
+
+                    {(item.status === 'queued' || item.status === 'paused') && (
+                      <>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-icon"
+                          title="Start immediately"
+                          aria-label={`Start ${item.filename} immediately`}
+                          onClick={() => void onResume(item.id, true)}
+                        >
+                          <ArrowUpToLine size={14} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-icon"
+                          title="Move up in queue"
+                          aria-label={`Move ${item.filename} up in queue`}
+                          onClick={() => void onPriority(item.id, 'up')}
+                        >
+                          <ArrowUp size={14} aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-icon"
+                          title="Move down in queue"
+                          aria-label={`Move ${item.filename} down in queue`}
+                          onClick={() => void onPriority(item.id, 'down')}
+                        >
+                          <ArrowDown size={14} aria-hidden="true" />
+                        </button>
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => onInspectDrawer(item)}
+                    >
+                      <Eye size={14} aria-hidden="true" />
+                      Inspect
+                    </button>
+
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-danger-ghost btn-icon"
+                      title="Remove from list"
+                      aria-label={`Remove ${item.filename}`}
+                      onClick={() => void onRemove(item.id, false)}
+                    >
+                      <Trash2 size={14} aria-hidden="true" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="progress-wrap">
+                  <div
+                    className="progress-track"
+                    role="progressbar"
+                    aria-label={`Progress for ${item.filename}`}
+                    aria-valuenow={pct}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                  >
+                    <div
+                      className={`progress-fill ${item.status}`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+
+                  {item.segments.length > 1 && (
+                    <div
+                      className="segments-strip"
+                      title={`${item.segments.length} parallel segment lanes`}
+                      aria-hidden="true"
+                    >
+                      {item.segments.map((seg) => {
+                        const segTotal = seg.end >= 0 ? seg.end - seg.start + 1 : 0;
+                        const segPct =
+                          segTotal > 0 ? Math.min(100, (seg.downloaded / segTotal) * 100) : 0;
+                        return (
+                          <div key={seg.id} className="segment-lane">
+                            <div
+                              className={`segment-lane-fill ${seg.status}`}
+                              style={{ width: `${segPct}%` }}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {item.error && (
+                  <div
+                    className="badge badge-danger"
+                    style={{ marginTop: 10, borderRadius: 8, padding: '6px 10px' }}
+                  >
+                    {item.error}
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}

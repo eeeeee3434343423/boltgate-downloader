@@ -1,0 +1,46 @@
+# BoltGate — Safe-First Multi-Segment Accelerated Downloader
+
+BoltGate is a local-first accelerated download manager featuring a pre-download **Safety Gate**, **multi-segment parallel HTTP/HTTPS downloads with dynamic work-stealing**, **digital book anti-corruption verification** (`.epub`, `.pdf`, `.mobi`, `.azw3`, `.djvu`, `.cbz`, `.cbr`, `.fb2`), and **polite mirror queueing** for bulk link pastes.
+
+- **Live Web UI (GitHub Pages):** https://eeeeee3434343423.github.io/boltgate-downloader/
+- **Repository:** https://github.com/eeeeee3434343423/boltgate-downloader
+
+---
+
+## Why a Local Engine + Hosted UI?
+
+Web browsers block multi-connection `Range` acceleration, TLS/header inspection, and direct large-file assembly across external hosts due to **CORS** and sandbox rules. BoltGate solves this cleanly:
+
+1. Start the lightweight local Node.js engine on your PC (zero runtime server dependencies).
+2. Open either the **Live GitHub Pages UI** above or `http://127.0.0.1:3847` directly — the UI connects automatically to your local engine so files download fast and save straight to disk.
+
+---
+
+## Quick Start
+
+### Windows (1-Click)
+Double-click `Launch-BoltGate.bat`, or run in PowerShell:
+
+```powershell
+git clone https://github.com/eeeeee3434343423/boltgate-downloader.git
+cd boltgate-downloader
+npm install
+npm run build
+npm start
+```
+
+### Bulk Links & Digital Books (Anti-Corruption)
+- **Bulk Paste** extracts multiple links from text or lists and inspects every link before downloading.
+- **Digital Books (Anti-Corrupt) preset** limits concurrent connections per mirror host (avoiding `429` rate limits and HTML countdown traps) and automatically handles `Retry-After` pauses.
+- **Automatic File Verification** checks SHA-256 checksums plus binary headers/trailers (`%PDF-` / `%%EOF`, EPUB/CBZ ZIP `PK` + EOCD, `BOOKMOBI`, `AT&TFORM`, `Rar!`, `FictionBook`, and HTML-trap detection) right when each file finishes.
+- *Note:* BoltGate accelerates **direct file URLs**; it cannot bypass manual CAPTCHAs or site-side browser waiting rooms.
+
+---
+
+## Architecture
+
+- `server/inspector.ts` — Zero-payload Safety Gate (redirect chains, TLS verification, MIME vs. extension checks, double-extension detection, range probe).
+- `server/engine.ts` — Multi-segment `FileHandle` positional writer (`pwrite`), dynamic tail work-stealing, pause/resume persistence, `429`/`503` `Retry-After` backoff, and streaming SHA-256.
+- `server/verifier.ts` — Constant-memory binary header/EOF/HTML-trap integrity checker for ebooks and archives.
+- `server/manager.ts` & `server/app.ts` — Queue scheduler (global + per-host limits), SSE telemetry, Trust List rules, and allowlisted CORS/PNA REST server.
+- `src/` — Accessible WCAG 2.2 AA React 19 + TypeScript UI.

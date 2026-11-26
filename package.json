@@ -1,0 +1,30 @@
+{
+  "name": "boltgate-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BoltGate — Safe-First Multi-Segment Accelerated Download Manager",
+  "scripts": {
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "build": "npm run build:server && npm run build:web",
+    "start": "node dist-server/server/index.js",
+    "dev:server": "npm run build:server && node dist-server/server/index.js",
+    "dev:web": "vite",
+    "test": "npm run build:server && node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.2",
+    "@types/react-dom": "^19.1.2",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
