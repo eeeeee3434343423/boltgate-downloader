@@ -99,6 +99,25 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
                   <th>ETag</th>
                   <td className="mono">{item.etag ?? '—'}</td>
                 </tr>
+                {item.expectedMd5 && (
+                  <tr>
+                    <th>Expected MD5</th>
+                    <td className="mono">{item.expectedMd5}</td>
+                  </tr>
+                )}
+                {item.md5 && (
+                  <tr>
+                    <th>Computed MD5</th>
+                    <td className="mono">
+                      {item.md5}{' '}
+                      {item.md5Verified === true
+                        ? '(Verified)'
+                        : item.md5Verified === false
+                          ? '(Mismatch!)'
+                          : ''}
+                    </td>
+                  </tr>
+                )}
                 {item.sha256 && (
                   <tr>
                     <th>SHA-256</th>
@@ -108,6 +127,25 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
               </tbody>
             </table>
           </section>
+
+          {item.routingLog && item.routingLog.length > 0 && (
+            <section>
+              <h3 style={{ margin: '0 0 8px', fontSize: 13.5 }}>
+                Source Routing Log ({item.routingLog.length})
+              </h3>
+              <div className="routing-log">
+                {item.routingLog.map((entry, idx) => (
+                  <div key={idx} className="routing-log-row">
+                    <span className="mono num" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                      {new Date(entry.timestamp).toLocaleTimeString()}
+                    </span>
+                    <span className={`badge badge-${entry.level}`}>{entry.level.toUpperCase()}</span>
+                    <span>{entry.message}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           {item.integrity && (
             <section>
@@ -197,6 +235,41 @@ export function InspectDrawer({ item, onClose }: InspectDrawerProps) {
                   Final: [{safety.statusCode ?? '—'}] {safety.finalUrl}
                 </div>
               </div>
+            </section>
+          )}
+
+          {item.mirrorTelemetry && item.mirrorTelemetry.length > 0 && (
+            <section>
+              <h3 style={{ margin: '0 0 8px', fontSize: 13.5 }}>
+                Source Telemetry ({item.mirrorTelemetry.length})
+              </h3>
+              <table className="kv-table source-breakdown-table">
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    <th>Status</th>
+                    <th>Workers</th>
+                    <th>Downloaded</th>
+                    <th>Speed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {item.mirrorTelemetry.map((m, idx) => (
+                    <tr key={`${m.url}-${idx}`}>
+                      <td>
+                        <div style={{ fontWeight: 600 }}>{m.label}</div>
+                        <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                          {m.host} ({m.tier})
+                        </div>
+                      </td>
+                      <td>{m.status}</td>
+                      <td className="num">{m.activeWorkers}</td>
+                      <td className="num">{formatBytes(m.downloadedBytes)}</td>
+                      <td className="num">{formatSpeed(m.speedBps)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </section>
           )}
 

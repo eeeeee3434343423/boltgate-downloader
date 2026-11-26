@@ -276,7 +276,12 @@ test('TokenBucketThrottle limits throughput and cancels immediately on AbortSign
 
 test('DownloadRunner respects HTTP 429 Retry-After header and finishes cleanly', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-eng-429-'));
-  const { buf: payload, sha256: expectedHash } = makeDeterministicPayload(512 * 1024);
+  const rawBody = makeDeterministicPayload(512 * 1024).buf;
+  const zipHeader = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]);
+  const zipEocd = Buffer.alloc(22);
+  Buffer.from([0x50, 0x4b, 0x05, 0x06]).copy(zipEocd, 0);
+  const payload = Buffer.concat([zipHeader, rawBody, zipEocd]);
+  const expectedHash = crypto.createHash('sha256').update(payload).digest('hex');
 
   let hits = 0;
   const server = http.createServer((req, res) => {
@@ -317,7 +322,12 @@ test('DownloadRunner respects HTTP 429 Retry-After header and finishes cleanly',
 
 test('DownloadRunner stripes across fast & slow mirrors, fails over on 429, and defaults to 128 KiB ebook segments', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-eng-mirrors-'));
-  const { buf: payload, sha256: expectedHash } = makeDeterministicPayload(1536 * 1024); // 1.5 MiB
+  const rawBody = makeDeterministicPayload(1536 * 1024).buf;
+  const zipHeader = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00]);
+  const zipEocd = Buffer.alloc(22);
+  Buffer.from([0x50, 0x4b, 0x05, 0x06]).copy(zipEocd, 0);
+  const payload = Buffer.concat([zipHeader, rawBody, zipEocd]);
+  const expectedHash = crypto.createHash('sha256').update(payload).digest('hex');
 
   let mirrorAHits = 0;
   let mirrorBHits = 0;
@@ -372,6 +382,7 @@ test('DownloadRunner stripes across fast & slow mirrors, fails over on 429, and 
       connections: 8,
       supportsRanges: true,
     });
+    item.expectedSha256 = expectedHash;
     item.mirrorUrls = [
       `http://127.0.0.1:${a.port}/ebook.epub`,
       `http://127.0.0.1:${b.port}/ebook.epub`,

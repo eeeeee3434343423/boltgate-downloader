@@ -7,10 +7,14 @@ import test from 'node:test';
 import { createAppServer } from '../dist-server/server/app.js';
 import { DownloadManager } from '../dist-server/server/manager.js';
 
-async function jsonReq(baseUrl, route, method = 'GET', body) {
+async function jsonReq(baseUrl, route, method = 'GET', body, sessionToken = '') {
+  const headers = { 'Content-Type': 'application/json' };
+  if (sessionToken) {
+    headers['X-BoltGate-Session'] = sessionToken;
+  }
   const res = await fetch(`${baseUrl}${route}`, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json();
@@ -45,19 +49,26 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const baseUrl = `http://127.0.0.1:${port}`;
+  const token = manager.getSessionToken();
 
   try {
     // 1. Inspect local benchmark link (4 MB) -> must hold in Safety Gate!
-    const inspectRes = await jsonReq(baseUrl, '/api/inspect', 'POST', {
-      text: `${baseUrl}/api/local-benchmark?sizeMB=4`,
-    });
+    const inspectRes = await jsonReq(
+      baseUrl,
+      '/api/inspect',
+      'POST',
+      {
+        text: `${baseUrl}/api/local-benchmark?sizeMB=4`,
+      },
+      token
+    );
     assert.equal(inspectRes.status, 200);
     assert.equal(inspectRes.data.items.length, 1);
     const id = inspectRes.data.items[0].id;
 
     // Wait for probe to complete -> pending_review
     const reviewed = await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const item = st.data.downloads.find((d) => d.id === id);
       return item?.status === 'pending_review' ? item : null;
     });
@@ -67,15 +78,21 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
     assert.equal(reviewed.supportsRanges, true);
 
     // 2. Approve ("Deem Safe & Download") with Trust Domain
-    const approveRes = await jsonReq(baseUrl, `/api/downloads/${id}/approve`, 'POST', {
-      trustDomain: true,
-      connections: 4,
-    });
+    const approveRes = await jsonReq(
+      baseUrl,
+      `/api/downloads/${id}/approve`,
+      'POST',
+      {
+        trustDomain: true,
+        connections: 4,
+      },
+      token
+    );
     assert.equal(approveRes.status, 200);
 
     // Wait for completion
     const completed = await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const item = st.data.downloads.find((d) => d.id === id);
       return item?.status === 'completed' ? item : null;
     });
@@ -89,35 +106,47 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
     assert.equal(completed.sha256, actualHash);
 
     // 3. Verify Hash API (match + mismatch)
-    const matchRes = await jsonReq(baseUrl, `/api/downloads/${id}/verify-hash`, 'POST', {
-      expectedSha256: actualHash,
-    });
+    const matchRes = await jsonReq(
+      baseUrl,
+      `/api/downloads/${id}/verify-hash`,
+      'POST',
+      {
+        expectedSha256: actualHash,
+      },
+      token
+    );
     assert.equal(matchRes.status, 200);
     assert.equal(matchRes.data.match, true);
 
-    const mismatchRes = await jsonReq(baseUrl, `/api/downloads/${id}/verify-hash`, 'POST', {
-      expectedSha256: '0'.repeat(64),
-    });
+    const mismatchRes = await jsonReq(
+      baseUrl,
+      `/api/downloads/${id}/verify-hash`,
+      'POST',
+      {
+        expectedSha256: '0'.repeat(64),
+      },
+      token
+    );
     assert.equal(mismatchRes.status, 200);
     assert.equal(mismatchRes.data.match, false);
 
     // 4. Soft remove & Undo Restore
-    const delRes = await jsonReq(baseUrl, `/api/downloads/${id}?deleteFile=false`, 'DELETE');
+    const delRes = await jsonReq(baseUrl, `/api/downloads/${id}?deleteFile=false`, 'DELETE', undefined, token);
     assert.equal(delRes.status, 200);
     assert.equal(delRes.data.undoable, true);
 
-    const restoreRes = await jsonReq(baseUrl, `/api/downloads/${id}/restore`, 'POST', {});
+    const restoreRes = await jsonReq(baseUrl, `/api/downloads/${id}/restore`, 'POST', {}, token);
     assert.equal(restoreRes.status, 200);
     assert.equal(restoreRes.data.item.id, id);
 
     // 5. Trust rule added during approve + safety block on open-file for executable
-    const stAfter = await jsonReq(baseUrl, '/api/state');
+    const stAfter = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
     assert.ok(
       stAfter.data.trustRules.some((r) => r.domain === '127.0.0.1' && r.status === 'trusted')
     );
 
     // 6. verify-integrity endpoint + CORS allowlist + CSRF guard
-    const integRes = await jsonReq(baseUrl, `/api/downloads/${id}/verify-integrity`, 'POST', {});
+    const integRes = await jsonReq(baseUrl, `/api/downloads/${id}/verify-integrity`, 'POST', {}, token);
     assert.equal(integRes.status, 200);
     assert.equal(integRes.data.integrity.status, 'unchecked');
 
@@ -146,20 +175,26 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
     assert.equal(evilPost.status, 403);
 
     // 7. maxConcurrentPerHost=1 serializes same-host queued downloads cleanly
-    await jsonReq(baseUrl, '/api/settings', 'PATCH', { speedPreset: 'books' });
-    const stBooks = await jsonReq(baseUrl, '/api/state');
+    await jsonReq(baseUrl, '/api/settings', 'PATCH', { speedPreset: 'books' }, token);
+    const stBooks = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
     assert.equal(stBooks.data.settings.speedPreset, 'books');
     assert.equal(stBooks.data.settings.maxConcurrentPerHost, 1);
 
-    const b1 = await jsonReq(baseUrl, '/api/inspect', 'POST', {
-      text: `${baseUrl}/api/local-benchmark?sizeMB=2\n${baseUrl}/api/local-benchmark?sizeMB=3`,
-    });
+    const b1 = await jsonReq(
+      baseUrl,
+      '/api/inspect',
+      'POST',
+      {
+        text: `${baseUrl}/api/local-benchmark?sizeMB=2\n${baseUrl}/api/local-benchmark?sizeMB=3`,
+      },
+      token
+    );
     assert.equal(b1.status, 200);
     assert.equal(b1.data.items.length, 2);
 
     const [idA, idB] = b1.data.items.map((x) => x.id);
     await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const a = st.data.downloads.find((d) => d.id === idA);
       const b = st.data.downloads.find((d) => d.id === idB);
       return a?.status === 'pending_review' && b?.status === 'pending_review';
@@ -173,9 +208,9 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
       if (activeSameHost > 1) sawBothDownloadingSimultaneously = true;
     }, 10);
 
-    await jsonReq(baseUrl, '/api/downloads/approve-batch', 'POST', { ids: [idA, idB] });
+    await jsonReq(baseUrl, '/api/downloads/approve-batch', 'POST', { ids: [idA, idB] }, token);
     await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const a = st.data.downloads.find((d) => d.id === idA);
       const b = st.data.downloads.find((d) => d.id === idB);
       return a?.status === 'completed' && b?.status === 'completed';
@@ -203,7 +238,7 @@ test('Full Safety Gate -> Approve -> Multi-Stream Download -> Verify SHA-256 -> 
   }
 });
 
-test('POST /api/inspect-mirrors verifies matching mirrors, excludes mismatched sizes, and completes striped download', async () => {
+test('POST /api/inspect-mirrors treats query-differentiated URLs as distinct resources (no digest -> no striping), excludes mismatched sizes, and completes single-source', async () => {
   const tmpDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-mirror-data-'));
   const tmpDownloadDir = await fs.mkdtemp(path.join(os.tmpdir(), 'boltgate-mirror-dl-'));
 
@@ -215,33 +250,48 @@ test('POST /api/inspect-mirrors verifies matching mirrors, excludes mismatched s
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
   const baseUrl = `http://127.0.0.1:${port}`;
+  const token = manager.getSessionToken();
 
   try {
-    const res = await jsonReq(baseUrl, '/api/inspect-mirrors', 'POST', {
-      text: [
-        `${baseUrl}/api/local-benchmark?sizeMB=2&m=1`,
-        `${baseUrl}/api/local-benchmark?sizeMB=2&m=2`,
-        `${baseUrl}/api/local-benchmark?sizeMB=3&m=bad`,
-      ].join('\n'),
-    });
+    const res = await jsonReq(
+      baseUrl,
+      '/api/inspect-mirrors',
+      'POST',
+      {
+        text: [
+          `${baseUrl}/api/local-benchmark?sizeMB=2&m=1`,
+          `${baseUrl}/api/local-benchmark?sizeMB=2&m=2`,
+          `${baseUrl}/api/local-benchmark?sizeMB=3&m=bad`,
+        ].join('\n'),
+      },
+      token
+    );
     assert.equal(res.status, 200);
     assert.equal(res.data.items.length, 1);
     const id = res.data.items[0].id;
 
     const reviewed = await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const item = st.data.downloads.find((d) => d.id === id);
       return item?.status === 'pending_review' ? item : null;
     });
 
-    assert.equal(reviewed.mirrorUrls.length, 2);
+    // Same path + same ETag but DIFFERENT query string = different resource identity. Without a
+    // trusted digest these must never be striped together (equal ETags only prove identity
+    // within one exact resource).
+    assert.equal(reviewed.mirrorUrls.length, 1);
     assert.equal(reviewed.safety.mirrorReports.length, 3);
+    assert.equal(reviewed.safety.mirrorReports[1].included, false);
+    assert.ok(
+      reviewed.safety.mirrorReports[1].excludeReason.includes('trusted MD5/SHA-256 digest'),
+      `Expected independent-resource exclusion, got: ${reviewed.safety.mirrorReports[1].excludeReason}`
+    );
     assert.equal(reviewed.safety.mirrorReports[2].included, false);
     assert.ok(reviewed.safety.mirrorReports[2].excludeReason.includes('Size mismatch'));
 
-    await jsonReq(baseUrl, `/api/downloads/${id}/approve`, 'POST', {});
+    await jsonReq(baseUrl, `/api/downloads/${id}/approve`, 'POST', {}, token);
     const completed = await waitFor(async () => {
-      const st = await jsonReq(baseUrl, '/api/state');
+      const st = await jsonReq(baseUrl, '/api/state', 'GET', undefined, token);
       const item = st.data.downloads.find((d) => d.id === id);
       return item?.status === 'completed' ? item : null;
     });

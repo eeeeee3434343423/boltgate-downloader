@@ -1,7 +1,10 @@
 import {
+  Activity,
   ArrowDown,
   ArrowUp,
   ArrowUpToLine,
+  ChevronDown,
+  ChevronUp,
   Download,
   Eye,
   Pause,
@@ -39,6 +42,7 @@ export function DownloadsView({
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [categoryFilter, setCategoryFilter] = useState<'all' | FileCategory>('all');
+  const [expandedTelemetry, setExpandedTelemetry] = useState<Record<string, boolean>>({});
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -78,7 +82,7 @@ export function DownloadsView({
             Downloads ({items.length})
           </h1>
           <p className="view-subtitle">
-            Multi-segment parallel transfers with pause/resume, priority queueing, and work-stealing.
+            Adaptive multi-mirror swarming, rolling speed-floor switching, .part.meta crash resume, and work-stealing.
           </p>
         </div>
 
@@ -194,7 +198,30 @@ export function DownloadsView({
               item.totalBytes && item.totalBytes > 0
                 ? Math.min(100, Math.round((item.downloadedBytes / item.totalBytes) * 100))
                 : 0;
-            const activeStreams = item.segments.filter((s) => s.status === 'active').length;
+            const activeWorkers =
+              item.segments.filter((s) => s.status === 'active').length ||
+              item.mirrorTelemetry?.reduce((sum, m) => sum + m.activeWorkers, 0) ||
+              0;
+            const activeMirrorsCount =
+              item.mirrorTelemetry?.filter((m) => m.activeWorkers > 0).length ?? 0;
+            const latestRoute =
+              item.routingLog && item.routingLog.length > 0
+                ? item.routingLog[item.routingLog.length - 1]
+                : null;
+            const hasTelemetryDetails = Boolean(
+              (item.mirrorTelemetry && item.mirrorTelemetry.length > 0) ||
+                (item.routingLog && item.routingLog.length > 0)
+            );
+            const isExpanded = Boolean(expandedTelemetry[item.id]);
+
+            let displayHost = item.safety?.finalHost ?? 'source';
+            if (!item.safety?.finalHost) {
+              try {
+                displayHost = new URL(item.finalUrl).hostname || 'source';
+              } catch {
+                displayHost = 'p2p';
+              }
+            }
 
             return (
               <article key={item.id} className="card">
@@ -216,15 +243,33 @@ export function DownloadsView({
                         }`}
                       >
                         {item.status === 'verifying'
-                          ? 'Verifying SHA-256'
+                          ? 'Verifying MD5 & SHA-256'
                           : item.status === 'downloading'
-                            ? `Downloading (${activeStreams} stream${activeStreams === 1 ? '' : 's'})`
+                            ? `Downloading (${activeWorkers} worker${activeWorkers === 1 ? '' : 's'})`
                             : item.status[0]!.toUpperCase() + item.status.slice(1)}
                       </span>
                       <span className="badge">{categoryLabel(item.category)}</span>
-                      {item.mirrorUrls && item.mirrorUrls.length > 1 && (
+                      {item.sourceBadge && (
+                        <span className="badge badge-info num">{item.sourceBadge}</span>
+                      )}
+                      {item.sourceProvenance && (
+                        <span className="badge mono" title={`Provenance: ${item.sourceProvenance}`}>
+                          {item.sourceProvenance}
+                        </span>
+                      )}
+                      {activeMirrorsCount >= 2 && !item.sourceBadge?.includes('Swarming') && (
                         <span className="badge badge-info num">
-                          {item.mirrorUrls.length} mirrors
+                          Swarming {activeMirrorsCount} mirrors
+                        </span>
+                      )}
+                      {item.telemetry?.throttledByLocalCap && (
+                        <span className="badge badge-warn num">
+                          Local cap ({formatSpeed(item.telemetry.localCapBps)})
+                        </span>
+                      )}
+                      {item.telemetry && item.telemetry.backingOffHosts.length > 0 && (
+                        <span className="badge badge-warn">
+                          Backoff: {item.telemetry.backingOffHosts.join(', ')}
                         </span>
                       )}
                     </div>
@@ -237,14 +282,20 @@ export function DownloadsView({
                         <>
                           <span>•</span>
                           <strong style={{ color: 'var(--accent-text)' }}>
-                            {formatSpeed(item.speedBps)}
+                            Net {formatSpeed(item.telemetry?.networkSpeedBps ?? item.speedBps)}
                           </strong>
+                          {item.telemetry && item.telemetry.diskSpeedBps > 0 && (
+                            <>
+                              <span>•</span>
+                              <span>Disk {formatSpeed(item.telemetry.diskSpeedBps)}</span>
+                            </>
+                          )}
                           <span>•</span>
                           <span>ETA {formatEta(item.etaSeconds)}</span>
                         </>
                       )}
                       <span>•</span>
-                      <span className="mono">{item.safety?.finalHost ?? new URL(item.finalUrl).hostname}</span>
+                      <span className="mono">{displayHost}</span>
                     </div>
                   </div>
 
@@ -369,18 +420,114 @@ export function DownloadsView({
                   )}
                 </div>
 
+                {latestRoute && (
+                  <div className="route-summary-line">
+                    <Activity size={13} aria-hidden="true" />
+                    <span>{latestRoute.message}</span>
+                  </div>
+                )}
+
+                {hasTelemetryDetails && (
+                  <div style={{ marginTop: 8 }}>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      aria-expanded={isExpanded}
+                      onClick={() =>
+                        setExpandedTelemetry((prev) => ({ ...prev, [item.id]: !prev[item.id] }))
+                      }
+                    >
+                      {isExpanded ? (
+                        <>
+                          <ChevronUp size={14} aria-hidden="true" /> Hide Sources &amp; Routing Log
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={14} aria-hidden="true" /> Sources &amp; Routing Log
+                          {item.mirrorTelemetry && item.mirrorTelemetry.length > 0
+                            ? ` (${item.mirrorTelemetry.length})`
+                            : ''}
+                        </>
+                      )}
+                    </button>
+
+                    {isExpanded && (
+                      <div className="signal-details-list">
+                        {item.mirrorTelemetry && item.mirrorTelemetry.length > 0 && (
+                          <table className="kv-table source-breakdown-table">
+                            <thead>
+                              <tr>
+                                <th>Source</th>
+                                <th>Status</th>
+                                <th>Workers</th>
+                                <th>Downloaded</th>
+                                <th>Speed</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {item.mirrorTelemetry.map((m, idx) => (
+                                <tr key={`${m.url}-${idx}`}>
+                                  <td>
+                                    <div style={{ fontWeight: 600 }}>{m.label}</div>
+                                    <div className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                      {m.host} ({m.tier})
+                                    </div>
+                                  </td>
+                                  <td>
+                                    <span
+                                      className={`badge ${
+                                        m.status === 'active'
+                                          ? 'badge-ok'
+                                          : m.status === 'evicted' || m.status === 'cooldown'
+                                            ? 'badge-warn'
+                                            : m.status === 'failed'
+                                              ? 'badge-danger'
+                                              : ''
+                                      }`}
+                                    >
+                                      {m.status}
+                                    </span>
+                                  </td>
+                                  <td className="num">{m.activeWorkers}</td>
+                                  <td className="num">{formatBytes(m.downloadedBytes)}</td>
+                                  <td className="num">{formatSpeed(m.speedBps)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+
+                        {item.routingLog && item.routingLog.length > 0 && (
+                          <div className="routing-log">
+                            {item.routingLog.map((entry, idx) => (
+                              <div key={idx} className="routing-log-row">
+                                <span className="mono num" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                  {new Date(entry.timestamp).toLocaleTimeString()}
+                                </span>
+                                <span className={`badge badge-${entry.level}`}>{entry.level.toUpperCase()}</span>
+                                <span>{entry.message}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {item.status === 'downloading' &&
                   item.startedAt &&
                   Date.now() - item.startedAt > 4000 &&
                   item.speedBps > 0 &&
-                  item.speedBps < 512 * 1024 && (
+                  item.speedBps < 512 * 1024 &&
+                  (!item.mirrorTelemetry || item.mirrorTelemetry.length <= 1) && (
                     <div
                       className="badge badge-warn"
                       style={{ marginTop: 8, borderRadius: 8, padding: '6px 10px', whiteSpace: 'normal' }}
                     >
                       {!item.supportsRanges
                         ? 'Host disabled byte-range acceleration (single stream) — transfer speed is capped by the remote server.'
-                        : `Remote mirror is serving at ${formatSpeed(item.speedBps)} across ${activeStreams} stream(s) (likely server-side bandwidth cap). Combine alternate direct mirrors in Bulk Paste or try a faster mirror for MB/s speeds.`}
+                        : `Remote mirror is serving at ${formatSpeed(item.speedBps)} across ${activeWorkers} worker(s) (likely server-side bandwidth cap). Paste an Anna’s Archive link/MD5 or combine alternate direct mirrors for MB/s speeds.`}
                     </div>
                   )}
 

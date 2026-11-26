@@ -5,10 +5,11 @@
   "type": "module",
   "description": "BoltGate — Safe-First Multi-Segment Accelerated Download Manager",
   "scripts": {
-    "build:server": "tsc -p tsconfig.server.json",
+    "build:server": "node -e \"require('node:fs').rmSync('dist-server',{recursive:true,force:true})\" && tsc -p tsconfig.server.json",
     "build:web": "vite build",
     "build": "npm run build:server && npm run build:web",
     "start": "node dist-server/server/index.js",
+    "companion": "node dist-server/companion/index.js",
     "dev:server": "npm run build:server && node dist-server/server/index.js",
     "dev:web": "vite",
     "test": "npm run build:server && node --test tests/*.test.mjs",

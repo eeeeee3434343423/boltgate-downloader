@@ -358,15 +358,351 @@ export async function resolveUniquePath(
   for (let i = 0; i < 500; i++) {
     const candidate = i === 0 ? safe : `${stem} (${i})${ext}`;
     const savedPath = path.join(dir, candidate);
-    const partPath = `${savedPath}.boltpart`;
-    if (!(await exists(savedPath)) && !(await exists(partPath))) {
+    const partPath = `${savedPath}.part`;
+    const legacyPartPath = `${savedPath}.boltpart`;
+    if (!(await exists(savedPath)) && !(await exists(partPath)) && !(await exists(legacyPartPath))) {
       return { filename: candidate, savedPath, partPath };
     }
   }
 
   const fallback = `${stem}-${Date.now()}${ext}`;
   const savedPath = path.join(dir, fallback);
-  return { filename: fallback, savedPath, partPath: `${savedPath}.boltpart` };
+  return { filename: fallback, savedPath, partPath: `${savedPath}.part` };
+}
+
+export async function reserveExclusiveStagingFile(
+  dir: string,
+  desiredFilename: string,
+  jobId: string
+): Promise<{
+  filename: string;
+  savedPath: string;
+  partPath: string;
+  handle: fs.FileHandle;
+}> {
+  await fs.mkdir(dir, { recursive: true });
+  const { filename, savedPath } = await resolveUniquePath(dir, desiredFilename);
+  const ext = path.extname(filename);
+  const rawStem = ext ? filename.slice(0, -ext.length) : filename;
+  const shortStem = rawStem.slice(0, 64).replace(/[.\s]+$/, '') || 'file';
+  const safeJobId = jobId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16) || 'job';
+
+  for (let i = 0; i < 200; i++) {
+    const suffix = i === 0 ? '' : `-${i}`;
+    const partName = `.boltgate-${safeJobId}${suffix}-${shortStem}${ext}.part`;
+    const reserved = await tryReserveStagingPair(path.join(dir, partName));
+    if (reserved) return { filename, savedPath, partPath: reserved.partPath, handle: reserved.handle };
+  }
+
+  for (let i = 0; i < 20; i++) {
+    const randPartPath = path.join(
+      dir,
+      `.boltgate-${safeJobId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.part`
+    );
+    const reserved = await tryReserveStagingPair(randPartPath);
+    if (reserved) return { filename, savedPath, partPath: reserved.partPath, handle: reserved.handle };
+  }
+  throw new Error('Could not reserve an exclusive staging payload + checkpoint sidecar pair');
+}
+
+/** Suffix of the `.part.meta` checkpoint sidecar paired with every staging payload. */
+export const PART_META_SUFFIX = '.meta';
+
+/**
+ * Reserves a staging payload AND its `.part.meta` sidecar identity together, both exclusively.
+ * A slot whose sidecar already exists (e.g. an orphaned or locked stale checkpoint) is never
+ * paired with a new payload, so a stale checkpoint can never sit over a newly allocated file.
+ * The sidecar placeholder is empty (an invalid checkpoint) until the runner writes real metadata.
+ */
+async function tryReserveStagingPair(
+  partPath: string
+): Promise<{ partPath: string; handle: fs.FileHandle } | null> {
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(partPath, 'wx+');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') return null;
+    throw err;
+  }
+  const metaPath = `${partPath}${PART_META_SUFFIX}`;
+  try {
+    const metaFh = await fs.open(metaPath, 'wx');
+    await metaFh.close();
+    return { partPath, handle };
+  } catch (err) {
+    // Release ONLY the payload we just created; never touch the pre-existing sidecar.
+    await handle.close().catch(() => undefined);
+    await fs.unlink(partPath).catch(() => undefined);
+    if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') return null;
+    throw err;
+  }
+}
+
+export interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+}
+
+/** Captures the physical identity of a regular, non-symlink file (rejects links/junctions). */
+export async function captureFileIdentity(filePath: string): Promise<FileIdentity> {
+  const st = await fs.lstat(filePath, { bigint: true });
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`Refusing non-regular or symlinked file at ${path.basename(filePath)}`);
+  }
+  return { dev: st.dev, ino: st.ino, size: st.size, mtimeNs: st.mtimeNs };
+}
+
+export function sameFileIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs;
+}
+
+/**
+ * Validates that `targetDir` is physically inside `rootDir`: every existing path component BELOW
+ * the user-chosen root must be a real directory (no symlinks / junctions / reparse points), and the
+ * resolved real path must stay inside the real root.
+ */
+export async function assertPhysicalDirInside(targetDir: string, rootDir: string): Promise<void> {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(targetDir);
+  if (!isPathInsideDir(resolvedTarget, resolvedRoot)) {
+    throw new Error('Publication directory escapes the destination folder');
+  }
+  const rootStat = await fs.stat(resolvedRoot).catch(() => null);
+  if (rootStat && !rootStat.isDirectory()) {
+    throw new Error('Destination folder is not a directory');
+  }
+  const rel = path.relative(resolvedRoot, resolvedTarget);
+  let cursor = resolvedRoot;
+  for (const part of rel ? rel.split(path.sep) : []) {
+    cursor = path.join(cursor, part);
+    const st = await fs.lstat(cursor).catch((err: NodeJS.ErrnoException) => {
+      if (err?.code === 'ENOENT') return null;
+      throw err;
+    });
+    if (!st) break;
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new Error(`Refusing to publish through symlink/junction or non-directory "${part}"`);
+    }
+  }
+  const realRoot = await fs.realpath(resolvedRoot).catch(() => resolvedRoot);
+  const realTarget = await fs.realpath(resolvedTarget).catch(() => null);
+  if (realTarget && !isPathInsideDir(realTarget, realRoot)) {
+    throw new Error('Publication directory physically resolves outside the destination folder');
+  }
+}
+
+export interface PublishFsOps {
+  mkdir?: typeof fs.mkdir;
+  link?: typeof fs.link;
+  unlink?: typeof fs.unlink;
+  open?: typeof fs.open;
+  preserveStaging?: boolean;
+  /**
+   * Physical identity of the staging file captured when it was verified (hashed). Publication is
+   * refused if the staging file was swapped/replaced since, and the published path is re-checked.
+   */
+  expectedIdentity?: FileIdentity;
+  /** Destination root the publication directory must physically stay inside (no symlinks). */
+  physicalRootDir?: string;
+}
+
+async function copyStagingToHiddenTempInDir(
+  stagingPath: string,
+  destinationDir: string,
+  openFn: typeof fs.open,
+  unlinkFn: typeof fs.unlink
+): Promise<string> {
+  let destFh: fs.FileHandle | null = null;
+  let tmpPath = '';
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    tmpPath = path.join(
+      destinationDir,
+      `.boltgate-pub-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`
+    );
+    try {
+      destFh = await openFn(tmpPath, 'wx');
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') continue;
+      throw err;
+    }
+  }
+  if (!destFh) {
+    throw new Error('Could not allocate hidden temporary file for atomic publication');
+  }
+
+  let srcFh: fs.FileHandle | null = null;
+  try {
+    srcFh = await openFn(stagingPath, 'r');
+    const buf = Buffer.allocUnsafe(1024 * 1024);
+    let offset = 0;
+    while (true) {
+      const { bytesRead } = await srcFh.read(buf, 0, buf.length, offset);
+      if (bytesRead <= 0) break;
+      let written = 0;
+      while (written < bytesRead) {
+        const res = await destFh.write(buf, written, bytesRead - written, offset + written);
+        if (res.bytesWritten <= 0) {
+          throw new Error('Zero bytes written while staging file for atomic publication');
+        }
+        written += res.bytesWritten;
+      }
+      offset += bytesRead;
+    }
+    await destFh.datasync();
+  } catch (err) {
+    await destFh.close().catch(() => undefined);
+    await unlinkFn(tmpPath).catch(() => undefined);
+    throw err;
+  } finally {
+    if (srcFh) await srcFh.close().catch(() => undefined);
+  }
+  await destFh.close();
+  return tmpPath;
+}
+
+/**
+ * Publishes a verified staging file to a non-colliding final destination path atomically
+ * without replacing existing files or ever exposing a partial file at the destination path.
+ * On cross-device EXDEV, copies into a hidden temp file in `destinationDir`, datasyncs, then
+ * publishes via atomic no-replace hard link. If atomic no-replace linking is unsupported
+ * (EPERM / ENOTSUP), cleans up any temp file, preserves the verified staging file, and throws.
+ */
+export async function publishStagingFileAtomically(
+  stagingPath: string,
+  destinationDir: string,
+  desiredFilename: string,
+  fsOps: PublishFsOps = {}
+): Promise<{ filename: string; savedPath: string }> {
+  const mkdirFn = fsOps.mkdir ?? fs.mkdir;
+  const linkFn = fsOps.link ?? fs.link;
+  const unlinkFn = fsOps.unlink ?? fs.unlink;
+  const openFn = fsOps.open ?? fs.open;
+
+  await mkdirFn(destinationDir, { recursive: true });
+  // Validate the physical publication directory (no symlink/junction escapes) BEFORE linking
+  await assertPhysicalDirInside(destinationDir, fsOps.physicalRootDir ?? destinationDir);
+  const safe = sanitizeFilename(desiredFilename);
+  const ext = path.extname(safe);
+  const stem = ext ? safe.slice(0, -ext.length) : safe;
+
+  // Validate the staging file is still the exact regular file that was verified
+  const stagingIdentity = await captureFileIdentity(stagingPath);
+  if (fsOps.expectedIdentity && !sameFileIdentity(fsOps.expectedIdentity, stagingIdentity)) {
+    throw new Error('Verified staging file was replaced or modified before publication');
+  }
+
+  let linkSourcePath = stagingPath;
+  let linkSourceIdentity = stagingIdentity;
+  let sameDirTmpPath: string | null = null;
+
+  /** Confirms the published path is physically the file we linked (same dev/inode/size). */
+  const assertPublishedIdentity = async (candidatePath: string) => {
+    const published = await captureFileIdentity(candidatePath);
+    if (
+      published.dev !== linkSourceIdentity.dev ||
+      published.ino !== linkSourceIdentity.ino ||
+      published.size !== linkSourceIdentity.size
+    ) {
+      throw new Error('Published file identity does not match the verified staging file');
+    }
+  };
+
+  const tryPublishCandidate = async (
+    candidateName: string
+  ): Promise<{ filename: string; savedPath: string } | null> => {
+    const candidatePath = path.join(destinationDir, candidateName);
+    try {
+      await linkFn(linkSourcePath, candidatePath);
+      await assertPublishedIdentity(candidatePath);
+      if (sameDirTmpPath) {
+        await unlinkFn(sameDirTmpPath).catch(() => undefined);
+      }
+      if (!fsOps.preserveStaging) {
+        await unlinkFn(stagingPath).catch(() => undefined);
+      }
+      return { filename: candidateName, savedPath: candidatePath };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EEXIST') {
+        return null;
+      }
+      if (code === 'EXDEV' && !sameDirTmpPath) {
+        // Cross-device move: copy into a hidden synced temp file inside destinationDir,
+        // then retry atomic no-replace hard link without ever exposing a partial target.
+        sameDirTmpPath = await copyStagingToHiddenTempInDir(
+          stagingPath,
+          destinationDir,
+          openFn,
+          unlinkFn
+        );
+        linkSourcePath = sameDirTmpPath;
+        linkSourceIdentity = await captureFileIdentity(sameDirTmpPath);
+        if (linkSourceIdentity.size !== stagingIdentity.size) {
+          throw new Error('Cross-device publication copy size mismatch');
+        }
+        try {
+          await linkFn(linkSourcePath, candidatePath);
+          await assertPublishedIdentity(candidatePath);
+          await unlinkFn(sameDirTmpPath).catch(() => undefined);
+          if (!fsOps.preserveStaging) {
+            await unlinkFn(stagingPath).catch(() => undefined);
+          }
+          return { filename: candidateName, savedPath: candidatePath };
+        } catch (retryErr) {
+          const retryCode = (retryErr as NodeJS.ErrnoException)?.code;
+          if (retryCode === 'EEXIST') {
+            return null;
+          }
+          await unlinkFn(sameDirTmpPath).catch(() => undefined);
+          sameDirTmpPath = null;
+          if (retryCode === 'EPERM' || retryCode === 'ENOTSUP' || retryCode === 'EXDEV') {
+            throw Object.assign(
+              new Error(
+                `Atomic no-replace publication is unavailable on destination filesystem (${retryCode}); verified staging file preserved at ${stagingPath}`
+              ),
+              { code: retryCode }
+            );
+          }
+          throw retryErr;
+        }
+      }
+      if (sameDirTmpPath) {
+        await unlinkFn(sameDirTmpPath).catch(() => undefined);
+        sameDirTmpPath = null;
+      }
+      if (code === 'EPERM' || code === 'ENOTSUP') {
+        throw Object.assign(
+          new Error(
+            `Atomic no-replace publication is unavailable on destination filesystem (${code}); verified staging file preserved at ${stagingPath}`
+          ),
+          { code }
+        );
+      }
+      throw err;
+    }
+  };
+
+  try {
+    for (let i = 0; i < 500; i++) {
+      const candidateName = i === 0 ? safe : `${stem} (${i})${ext}`;
+      const published = await tryPublishCandidate(candidateName);
+      if (published) return published;
+    }
+
+    const fallbackName = `${stem}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}${ext}`;
+    const published = await tryPublishCandidate(fallbackName);
+    if (published) return published;
+    throw new Error(`Could not publish non-colliding destination path for ${safe}`);
+  } catch (err) {
+    if (sameDirTmpPath) {
+      await unlinkFn(sameDirTmpPath).catch(() => undefined);
+    }
+    throw err;
+  }
 }
 
 export function classifyFile(

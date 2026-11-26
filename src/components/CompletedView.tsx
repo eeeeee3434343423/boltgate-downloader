@@ -17,8 +17,8 @@ interface CompletedViewProps {
   items: DownloadItem[];
   onOpenFolder: (id: string) => Promise<void>;
   onOpenFile: (id: string) => Promise<void>;
-  onVerifyHash: (id: string, expectedSha256: string) => Promise<{ match: boolean; actual: string }>;
-  onRedownload: (url: string) => Promise<void>;
+  onVerifyHash: (id: string, expectedHash: string) => Promise<{ match: boolean; actual: string }>;
+  onRedownload: (id: string) => Promise<void>;
   onRemove: (id: string, deleteFile: boolean) => Promise<void>;
   onClearCompleted: () => Promise<void>;
   onInspectDrawer: (item: DownloadItem) => void;
@@ -68,7 +68,7 @@ export function CompletedView({
             Completed ({items.length})
           </h1>
           <p className="view-subtitle">
-            Verified files with automatic SHA-256 checksums and safe folder launch.
+            Verified files with automatic MD5 &amp; SHA-256 checksums, format checks, and safe folder launch.
           </p>
         </div>
 
@@ -130,7 +130,7 @@ export function CompletedView({
           </div>
           <h2 style={{ margin: 0, fontSize: 17 }}>No completed downloads yet</h2>
           <p style={{ margin: 0, maxWidth: 440, color: 'var(--text-muted)' }}>
-            Finished downloads appear here with their SHA-256 checksums and direct folder access.
+            Finished downloads appear here with their MD5 / SHA-256 checksums and direct folder access.
           </p>
         </div>
       ) : (
@@ -153,6 +153,21 @@ export function CompletedView({
                       <span className="item-title">{item.filename}</span>
                       <span className="badge badge-ok">Completed</span>
                       <span className="badge">{categoryLabel(item.category)}</span>
+                      {item.sourceBadge && (
+                        <span className="badge badge-info">{item.sourceBadge}</span>
+                      )}
+                      {item.md5Verified === true && (
+                        <span className="badge badge-ok" title={`Verified MD5 ${item.md5 ?? ''}`}>
+                          <ShieldCheck size={12} aria-hidden="true" />
+                          MD5 Verified
+                        </span>
+                      )}
+                      {item.md5Verified === false && (
+                        <span className="badge badge-danger">
+                          <ShieldAlert size={12} aria-hidden="true" />
+                          MD5 Mismatch
+                        </span>
+                      )}
                       {integrity?.status === 'valid' && (
                         <span className="badge badge-ok" title={integrity.summary}>
                           <ShieldCheck size={12} aria-hidden="true" />
@@ -188,6 +203,40 @@ export function CompletedView({
                       <span>•</span>
                       <span className="mono">{item.savedPath}</span>
                     </div>
+
+                    {item.verifiedFilePath && (item.publishedFiles?.length ?? 0) > 1 && (
+                      <div className="meta-line" style={{ marginTop: 4 }}>
+                        <span style={{ fontWeight: 600 }}>Checksums &amp; Open apply to:</span>
+                        <code className="mono" style={{ wordBreak: 'break-all' }}>
+                          {item.verifiedFileIndex ? `#${item.verifiedFileIndex} ` : ''}
+                          {item.verifiedFilePath}
+                        </code>
+                      </div>
+                    )}
+
+                    {item.md5 && (
+                      <div className="meta-line" style={{ marginTop: 4 }}>
+                        <span style={{ fontWeight: 600 }}>MD5:</span>
+                        <code className="mono" style={{ wordBreak: 'break-all' }}>
+                          {item.md5}
+                        </code>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => void copyText(`${item.id}-md5`, item.md5!)}
+                        >
+                          {copiedId === `${item.id}-md5` ? (
+                            <>
+                              <Check size={13} aria-hidden="true" /> Copied
+                            </>
+                          ) : (
+                            <>
+                              <Copy size={13} aria-hidden="true" /> Copy
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
 
                     {item.sha256 && (
                       <div className="meta-line" style={{ marginTop: 4 }}>
@@ -247,7 +296,7 @@ export function CompletedView({
                       onClick={() => setVerifyOpenId(isVerifyOpen ? null : item.id)}
                     >
                       <ShieldCheck size={14} aria-hidden="true" />
-                      Verify SHA-256
+                      Verify Checksum
                     </button>
 
                     <button
@@ -263,7 +312,7 @@ export function CompletedView({
                       className="btn btn-sm btn-icon"
                       title="Re-inspect and download again"
                       aria-label={`Re-download ${item.filename}`}
-                      onClick={() => void onRedownload(item.originalUrl)}
+                      onClick={() => void onRedownload(item.id)}
                     >
                       <RefreshCw size={14} aria-hidden="true" />
                     </button>
@@ -302,7 +351,7 @@ export function CompletedView({
                       <button
                         type="button"
                         className="btn btn-sm"
-                        onClick={() => void onRedownload(item.originalUrl)}
+                        onClick={() => void onRedownload(item.id)}
                       >
                         <RefreshCw size={14} aria-hidden="true" />
                         Re-inspect &amp; Retry
@@ -336,7 +385,7 @@ export function CompletedView({
                     }}
                   >
                     <label htmlFor={`hash-in-${item.id}`} className="sr-only">
-                      Paste expected SHA-256 checksum
+                      Paste expected SHA-256 or MD5 checksum
                     </label>
                     <input
                       id={`hash-in-${item.id}`}
@@ -347,7 +396,7 @@ export function CompletedView({
                       onChange={(e) =>
                         setHashInput((prev) => ({ ...prev, [item.id]: e.target.value }))
                       }
-                      placeholder="Paste publisher's 64-character SHA-256 hex digest…"
+                      placeholder="Paste 64-char SHA-256 or 32-char MD5 hex digest…"
                     />
                     <button type="submit" className="btn btn-sm btn-primary">
                       Compare Hash

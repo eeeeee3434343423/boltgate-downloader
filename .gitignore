@@ -2,6 +2,14 @@ node_modules/
 dist/
 dist-server/
 data/
+state.json
+secrets.enc.json
+.boltgate.key
+.companion-token
 *.boltpart
+*.bak
+*.backup
+backups/
+backup/
 .DS_Store
 Thumbs.db
