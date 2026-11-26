@@ -1,50 +1,67 @@
-# BoltGate — Safe-First Multi-Segment Accelerated Downloader
+# BoltGate — Safe-First Multi-Segment & Multi-Source Accelerated Downloader
 
-BoltGate is a local-first accelerated download manager featuring a pre-download **Safety Gate**, **multi-segment parallel HTTP/HTTPS downloads with dynamic work-stealing**, **digital book anti-corruption verification** (`.epub`, `.pdf`, `.mobi`, `.azw3`, `.djvu`, `.cbz`, `.cbr`, `.fb2`), and **polite mirror queueing** for bulk link pastes.
+BoltGate is a local-first accelerated download manager featuring a pre-download **Safety Gate**, a **4-tier fast-source resolver** for digital books (Tier 1 Fast API -> Tier 2 External Mirrors -> Tier 3 Concurrent IPFS Race -> Tier 4 `aria2c` P2P), **adaptive multi-mirror swarming with live 5-second speed-floor switching**, **digital book anti-corruption & MD5 verification**, and a **100% static GitHub Pages frontend**.
 
 - **Live Web UI (GitHub Pages):** https://eeeeee3434343423.github.io/boltgate-downloader/
 - **Repository:** https://github.com/eeeeee3434343423/boltgate-downloader
 
 ---
 
-## Why a Local Engine + Hosted UI?
+## Why a Local Companion Bridge (`/companion`) + Hosted Static UI?
 
-Web browsers block multi-connection `Range` acceleration, TLS/header inspection, and direct large-file assembly across external hosts due to **CORS** and sandbox rules. BoltGate solves this cleanly:
+Web browsers block multi-connection `Range` striping, cross-origin mirror racing, P2P torrents, TLS/header inspection, and direct large-file disk assembly due to **CORS** and sandbox rules. BoltGate keeps the frontend 100% static (`dist/`) on GitHub Pages while running all unrestricted networking, source resolution, candidate racing, and disk I/O inside the local **`/companion`** bridge:
 
-1. Start the lightweight local Node.js engine on your PC (zero runtime server dependencies).
-2. Open either the **Live GitHub Pages UI** above or `http://127.0.0.1:3847` directly — the UI connects automatically to your local engine so files download fast and save straight to disk.
+1. Start the local Companion Bridge on your PC (see [`companion/README.md`](./companion/README.md) for Windows & macOS commands).
+2. Open either the **Live GitHub Pages UI** above or `http://127.0.0.1:3847` directly — the UI connects automatically to your local Companion Bridge and writes verified files directly to disk.
 
 ---
 
 ## Quick Start
 
-### Windows (1-Click)
-Double-click `Launch-BoltGate.bat`, or run in PowerShell:
+### Windows (1-Click or PowerShell)
+Double-click `Launch-BoltGate.bat`, or run:
 
 ```powershell
 git clone https://github.com/eeeeee3434343423/boltgate-downloader.git
 cd boltgate-downloader
 npm install
 npm run build
-npm start
+npm run companion
 ```
 
-### Bulk Links & Digital Books (Anti-Corruption & Multi-Mirror Speed)
-- **Bulk Paste** extracts multiple links from text or lists and inspects every link before downloading.
-- **Same File — Combine Mirrors for Speed** lets you paste 2+ mirror URLs for the same file in **Bulk Paste**, verifies identical exact byte sizes + `Range` support, stripes parallel byte ranges across all verified mirrors simultaneously (`128 KiB` minimum segment threshold for ebooks), steals slow tails onto the fastest active mirror, and fails over automatically on `429`/`503`.
-- **Digital Books (Anti-Corrupt) preset** limits concurrent connections per mirror host (avoiding `429` rate limits and HTML countdown traps) and automatically honors `Retry-After` pauses.
-- **Automatic File Verification** checks SHA-256 checksums plus binary headers/trailers (`%PDF-` / `%%EOF`, EPUB/CBZ ZIP `PK` + EOCD, `BOOKMOBI`, `AT&TFORM`, `Rar!`, `FictionBook`, and HTML-trap detection) right when each file finishes.
-- **Live Speed Diagnostics** flag when a remote server omits byte ranges or hard-caps transfer speed server-side.
-- *Note:* BoltGate accelerates **direct file URLs**; it cannot bypass manual CAPTCHAs, waiting rooms, or server-side bandwidth caps.
+### macOS (Terminal)
+```bash
+git clone https://github.com/eeeeee3434343423/boltgate-downloader.git
+cd boltgate-downloader
+npm install
+npm run build
+chmod +x companion/start.sh
+./companion/start.sh
+```
+
+See [`companion/README.md`](./companion/README.md) for optional `aria2c` installation (`winget install aria2.aria2` / `brew install aria2`) and local IPFS gateway setup.
 
 ---
 
-## Project Context & Architecture
+## Key Capabilities
 
-- [`PROJECT_STATUS.md`](./PROJECT_STATUS.md) — Current status snapshot, update timeline, and next enhancements.
-- [`AGENTS.md`](./AGENTS.md) — Workspace rules, architecture map, safety boundaries, and verification commands (auto-loaded in Antigravity chats).
-- `server/inspector.ts` — Zero-payload Safety Gate (redirect chains, TLS verification, MIME vs. extension checks, double-extension detection, `HEAD` + `GET Range: bytes=0-0` fallback).
-- `server/engine.ts` — Multi-segment / multi-mirror `FileHandle` positional writer (`pwrite`), dynamic tail work-stealing, pause/resume persistence, `429`/`503` `Retry-After` & mirror failover, and streaming SHA-256.
-- `server/verifier.ts` — Constant-memory binary header/EOF/HTML-trap integrity checker for ebooks and archives.
-- `server/manager.ts` & `server/app.ts` — Queue scheduler (global + per-host limits), multi-mirror group verification (`POST /api/inspect-mirrors`), SSE telemetry, Trust List rules, and allowlisted CORS/PNA REST server.
-- `src/` — Accessible WCAG 2.2 AA React 19 + TypeScript UI.
+- **Smart Input Parser:** Paste direct file URLs, Anna's Archive book URLs (`/md5/<hash>`), raw 32-character MD5 hashes, multi-line mirror URLs, `magnet:?` links, `.torrent` URLs, or `ipfs://` URIs.
+- **4-Tier Fast-Source Resolver & Concurrent Benchmarking (`/companion`):**
+  - **Tier 1 (Fast API):** Uses your optional local Anna's Archive Fast Download API key (`/dyn/api/fast_download.json`) first when configured.
+  - **Tier 2 (External Mirrors & Metadata):** Resolves configurable external mirror URL templates (`{md5}`) and extracts mirrors/CIDs from clean metadata pages (strictly respecting anti-bot/CAPTCHA gates without bypassing them), deprioritizing Slow Partner links.
+  - **Tier 3 (IPFS Gateway Race):** Races local `http://127.0.0.1:8080/ipfs/<cid>` and public IPFS gateways concurrently (`HEAD` + 64 KiB `Range` throughput benchmark).
+  - **Tier 4 (`aria2c` P2P & 16-Connection Mode):** Detects host `aria2c` safely (`shell: false`) for magnets, selective single-file `.torrent` downloads, or 16-connection HTTP transfers; runs cleanly in Pure Node.js when `aria2c` is absent.
+- **Adaptive Swarming & Rolling Speed-Floor Switching:**
+  - Single fast (`> 2 MB/s`) ranged mirrors saturate with 8–16 parallel byte-range workers writing buffered `256 KiB` chunks into pre-allocated `.part` files.
+  - Equal-size mirrors swarm simultaneously across hosts; a rolling 5-second speed-floor monitor (`350 KB/s` default) evicts capped/rate-limited mirrors mid-flight, reassigns unfinished byte ranges to faster/standby mirrors, and logs every switch live in the UI.
+- **Crash-Safe Resume & Pre-Rename MD5 Verification:** Persists chunk progress atomically in `.part.meta`, computes MD5 before atomic rename when an expected MD5 is known (displaying **`MD5 Verified`** on completion), and validates binary ebook/archive headers & trailers (`server/verifier.ts`).
+
+---
+
+## Project Architecture
+
+- [`companion/README.md`](./companion/README.md) — Windows/macOS Companion setup & `aria2c` instructions.
+- `companion/` — Smart input parser, 4-tier source resolver (`resolver.ts`), 5-way concurrent candidate benchmarker (`benchmarker.ts`), bencode `.torrent` parser (`torrentParser.ts`), `.part.meta` manager (`partMeta.ts`), `aria2c` bridge (`aria2.ts`), and entrypoint (`index.ts`).
+- `shared/` — Pure TypeScript shared types (`types.ts`) and browser-safe smart input parser (`inputParser.ts`).
+- `server/` — Safety Gate inspector (`inspector.ts`), multi-mirror adaptive engine (`engine.ts`), binary integrity checker (`verifier.ts`), queue/trust/settings manager (`manager.ts`), atomic persistence (`store.ts`), and CORS/PNA REST+SSE router (`app.ts`).
+- `src/` — 100% static WCAG 2.2 AA React 19 + TypeScript UI deployed to GitHub Pages (`dist/`).

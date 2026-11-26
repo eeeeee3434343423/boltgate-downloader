@@ -53,6 +53,81 @@ export interface TlsInfo {
   error?: string;
 }
 
+export type SourceTier = 'fast_api' | 'mirror' | 'ipfs' | 'p2p' | 'direct';
+
+export type SourceMode =
+  | 'fast_api'
+  | 'swarm'
+  | 'ipfs_race'
+  | 'aria2_p2p'
+  | 'aria2_http'
+  | 'direct';
+
+export type DownloadEngine = 'node' | 'aria2';
+
+export interface RoutingLogEntry {
+  timestamp: number;
+  level: 'info' | 'ok' | 'warn' | 'danger';
+  message: string;
+}
+
+export interface MirrorSourceMeta {
+  sourceId?: string;
+  url: string;
+  label: string;
+  host: string;
+  tier: SourceTier;
+  isSlowPartner?: boolean;
+  etag?: string;
+  lastModified?: string;
+  provenance?: string;
+}
+
+export interface MirrorTelemetry {
+  sourceId?: string;
+  url: string;
+  label: string;
+  host: string;
+  tier: SourceTier;
+  status: 'active' | 'standby' | 'evicted' | 'cooldown' | 'failed';
+  speedBps: number;
+  downloadedBytes: number;
+  activeWorkers: number;
+  failures: number;
+  lastEvent?: string;
+  provenance?: string;
+}
+
+export interface TorrentFileEntry {
+  index: number;
+  path: string;
+  length: number;
+}
+
+export interface CompanionFeatureFlags {
+  singleSourceValidatorLock: boolean;
+  splitTelemetry: boolean;
+  writeOnlySecrets: boolean;
+  pairedSessionAuth: boolean;
+}
+
+export interface CompanionCapabilities {
+  aria2Available: boolean;
+  aria2Version?: string;
+  aria2Path?: string;
+  platform: string;
+  companionVersion: string;
+  apiVersion?: number;
+  buildId?: string;
+  requiresPairing?: boolean;
+  features?: CompanionFeatureFlags;
+  installHint: {
+    command: string;
+    label: string;
+    platform: string;
+  };
+}
+
 export interface MirrorProbeSummary {
   url: string;
   finalUrl: string;
@@ -63,6 +138,16 @@ export interface MirrorProbeSummary {
   riskLevel: RiskLevel;
   included: boolean;
   excludeReason?: string;
+  label?: string;
+  tier?: SourceTier;
+  probeSpeedBps?: number;
+  latencyMs?: number;
+  isSlowPartner?: boolean;
+  etag?: string;
+  lastModified?: string;
+  isHtmlTrap?: boolean;
+  contentType?: string;
+  provenance?: string;
 }
 
 export interface SafetyReport {
@@ -86,6 +171,13 @@ export interface SafetyReport {
   tls?: TlsInfo;
   duplicateOfId?: string;
   mirrorReports?: MirrorProbeSummary[];
+  expectedMd5?: string;
+  expectedSha256?: string;
+  resolvedCids?: string[];
+  torrentFiles?: TorrentFileEntry[];
+  torrentInfoHash?: string;
+  sourceMode?: SourceMode;
+  isP2P?: boolean;
   probedAt: number;
   probeError?: string;
 }
@@ -102,11 +194,29 @@ export interface SegmentState {
   lastError?: string;
 }
 
+export interface DownloadTelemetry {
+  networkSpeedBps: number;
+  diskSpeedBps: number;
+  committedBytes: number;
+  receivedBytes: number;
+  throttledByLocalCap: boolean;
+  configuredLocalCapBps?: number;
+  localCapBps: number;
+  serverThrottled?: boolean;
+  backingOffHosts: string[];
+  activeWorkers: number;
+  /** Display-only total reported by an external engine's rounded progress line (never authoritative). */
+  displayTotalBytes?: number;
+}
+
 export interface DownloadItem {
   id: string;
   originalUrl: string;
   finalUrl: string;
   mirrorUrls?: string[];
+  mirrorMeta?: MirrorSourceMeta[];
+  mirrorTelemetry?: MirrorTelemetry[];
+  routingLog?: RoutingLogEntry[];
   filename: string;
   destinationDir: string;
   savedPath: string;
@@ -123,10 +233,36 @@ export interface DownloadItem {
   supportsRanges: boolean;
   etag?: string;
   lastModified?: string;
+  pinnedEtag?: string;
+  pinnedLastModified?: string;
+  sourceProvenance?: string;
+  telemetry?: DownloadTelemetry;
   segments: SegmentState[];
   safety: SafetyReport | null;
+  expectedSha256?: string;
   sha256?: string;
   verifiedHashMatch?: boolean | null;
+  expectedMd5?: string;
+  md5?: string;
+  md5Verified?: boolean | null;
+  sourceMode?: SourceMode;
+  sourceBadge?: string;
+  engine?: DownloadEngine;
+  magnetUri?: string;
+  torrentUrl?: string;
+  torrentInfoHash?: string;
+  torrentRootName?: string;
+  selectFile?: string;
+  /** infoHash of the manifest `selectFile` indices refer to (selection identity binding). */
+  selectFileInfoHash?: string;
+  torrentFiles?: TorrentFileEntry[];
+  publishedFiles?: string[];
+  /**
+   * Multi-file P2P: the manifest index / relative path of the ONE file a job-level MD5/SHA-256 was
+   * verified against. `savedPath`, Open, and re-verification are bound to this same file.
+   */
+  verifiedFileIndex?: number;
+  verifiedFilePath?: string;
   integrity?: FileIntegrityReport;
   createdAt: number;
   approvedAt?: number;
@@ -148,7 +284,32 @@ export interface AppSettings {
   speedPreset: SpeedPreset;
   autoApproveTrusted: boolean;
   theme: 'light' | 'dark';
+  hasAnnasArchiveApiKey: boolean;
+  annasArchiveBaseUrl: string;
+  customMirrorUrls: string[];
+  ipfsGateways: string[];
+  minSpeedFloorKBps: number; // 0 = disabled; default 350
+  preferAria2: boolean;
+  /**
+   * Stable opaque identities for each exported (possibly masked) private template entry,
+   * index-aligned with `customMirrorUrls` / `ipfsGateways`.
+   */
+  templateRefs?: {
+    customMirrorUrls: string[];
+    ipfsGateways: string[];
+  };
 }
+
+/** A private template entry sent back to the engine: plaintext, or a stable stored-template reference. */
+export type TemplatePatchEntryValue = string | { ref: string };
+
+export type SettingsPatch = Partial<
+  Omit<AppSettings, 'hasAnnasArchiveApiKey' | 'templateRefs' | 'customMirrorUrls' | 'ipfsGateways'>
+> & {
+  annasArchiveApiKey?: string | null;
+  customMirrorUrls?: TemplatePatchEntryValue[];
+  ipfsGateways?: TemplatePatchEntryValue[];
+};
 
 export interface TrustRule {
   domain: string;
@@ -183,6 +344,7 @@ export interface AppStateSnapshot {
   speedHistory: number[];
   stats: AppStats;
   diskSpace: DiskSpaceInfo;
+  capabilities: CompanionCapabilities;
 }
 
 export type SSEEvent =

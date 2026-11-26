@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
+import { sanitizeUpstreamError } from '../companion/parser.js';
 import type { DownloadManager } from './manager.js';
 import { isPathInsideDir } from './utils.js';
 
@@ -20,17 +21,94 @@ const MIME_TYPES: Record<string, string> = {
   '.woff2': 'font/woff2',
 };
 
+export function assertLoopbackBindHost(host: string | undefined): string {
+  const trimmed = (host ?? '127.0.0.1').trim();
+  if (trimmed === '127.0.0.1' || trimmed === 'localhost' || trimmed === '::1') {
+    return trimmed;
+  }
+  if (trimmed === '[::1]') {
+    return '::1';
+  }
+  throw new Error(
+    `Refusing to bind BoltGate listener to non-loopback host "${trimmed}". Only 127.0.0.1, localhost, or ::1 are permitted.`
+  );
+}
+
+function isLoopbackSocketAddress(addr: string | undefined): boolean {
+  if (!addr) return false;
+  const norm = addr.trim().toLowerCase();
+  return (
+    norm === '127.0.0.1' ||
+    norm === '::1' ||
+    norm === '::ffff:127.0.0.1' ||
+    norm.startsWith('127.') ||
+    norm.startsWith('::ffff:127.')
+  );
+}
+
 export function createAppServer(options: AppServerOptions): http.Server {
   const { manager } = options;
   const distDir = options.distDir ?? path.resolve(process.cwd(), 'dist');
 
   const server = http.createServer(async (req, res) => {
     try {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-      const method = (req.method ?? 'GET').toUpperCase();
+      // Enforce loopback at the socket/listener level rather than relying solely on Host header
+      const localAddr = req.socket?.localAddress;
+      const remoteAddr = req.socket?.remoteAddress;
+      if (
+        (localAddr && !isLoopbackSocketAddress(localAddr)) ||
+        (remoteAddr && !isLoopbackSocketAddress(remoteAddr))
+      ) {
+        sendJson(res, 403, { error: 'Non-loopback socket connection rejected' });
+        return;
+      }
 
-      if (url.pathname.startsWith('/api/')) {
+      if (!isTrustedHostHeader(req.headers.host)) {
+        sendJson(res, 403, { error: 'Untrusted Host header' });
+        return;
+      }
+
+      const hostHeader = req.headers.host!.trim();
+      const serverOrigin = `http://${hostHeader}`.toLowerCase();
+      const url = new URL(req.url ?? '/', `http://${hostHeader}`);
+      const method = (req.method ?? 'GET').toUpperCase();
+      const origin = firstHeaderStr(req.headers.origin)?.trim();
+      const isApiRoute = url.pathname.startsWith('/api/');
+
+      if (isApiRoute) {
+        if (origin) {
+          const allowedOrigin = getAllowedCorsOrigin(origin);
+          if (!allowedOrigin) {
+            sendJson(res, 403, { error: 'Origin not allowed' });
+            return;
+          }
+          res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+          res.setHeader('Vary', 'Origin');
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-BoltGate-Session');
+          res.setHeader('Access-Control-Allow-Private-Network', 'true');
+        }
+
+        if (method === 'OPTIONS') {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
         await handleApiRequest(req, res, url, method, manager);
+        return;
+      }
+
+      // Non-API routes (HTML, SPA fallback, static assets): strictly companion's own origin only.
+      // Never grant cross-origin CORS/PNA permissions to UI HTML or static files.
+      if (origin && origin.toLowerCase() !== serverOrigin) {
+        sendJson(res, 403, { error: 'Cross-origin access to companion UI is not allowed' });
+        return;
+      }
+
+      const secFetchSite = firstHeaderStr(req.headers['sec-fetch-site'])?.trim().toLowerCase();
+      if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+        sendJson(res, 403, { error: 'Cross-site access to companion UI is not allowed' });
         return;
       }
 
@@ -39,12 +117,27 @@ export function createAppServer(options: AppServerOptions): http.Server {
         return;
       }
 
-      await serveStaticFile(res, url.pathname, distDir, method === 'HEAD');
+      // Require EXPLICIT Sec-Fetch-Mode: navigate AND Sec-Fetch-Site: same-origin|none
+      // before injecting a redeemable pairing code into HTML; never inject on missing fetch metadata.
+      const secFetchMode = firstHeaderStr(req.headers['sec-fetch-mode'])?.trim().toLowerCase();
+      const allowPairingCodeInjection =
+        (!origin || origin.toLowerCase() === serverOrigin) &&
+        secFetchMode === 'navigate' &&
+        (secFetchSite === 'same-origin' || secFetchSite === 'none');
+
+      await serveStaticFile(
+        res,
+        url.pathname,
+        distDir,
+        method === 'HEAD',
+        manager,
+        allowPairingCodeInjection
+      );
     } catch (err) {
       const status = (err as { status?: number })?.status ?? 500;
-      const message = err instanceof Error ? err.message : 'Internal server error';
+      const message = sanitizeUpstreamError(err, manager.getActiveSecrets(), 320);
       if (!res.headersSent) {
-        sendJson(res, status, { error: message });
+        sendJson(res, status, { error: message || 'Internal server error' });
       } else {
         res.end();
       }
@@ -61,34 +154,37 @@ async function handleApiRequest(
   method: string,
   manager: DownloadManager
 ): Promise<void> {
-  const origin = req.headers.origin;
-  if (origin) {
-    const allowedOrigin = getAllowedCorsOrigin(origin);
-    if (!allowedOrigin) {
-      if (
-        method === 'OPTIONS' ||
-        method === 'POST' ||
-        method === 'PATCH' ||
-        method === 'DELETE'
-      ) {
-        sendJson(res, 403, { error: 'Origin not allowed' });
-        return;
-      }
-    } else {
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-      res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-      res.setHeader('Access-Control-Allow-Private-Network', 'true');
-      if (method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-    }
+  const p = url.pathname;
+
+  if (p === '/api/health' && method === 'GET') {
+    const caps = manager.getCapabilities();
+    sendJson(res, 200, {
+      ok: true,
+      apiVersion: caps.apiVersion ?? 4,
+      companionVersion: caps.companionVersion,
+      requiresPairing: caps.requiresPairing ?? true,
+    });
+    return;
   }
 
-  const p = url.pathname;
+  if (p === '/api/session/pair' && method === 'POST') {
+    const body = await readJsonBody<{ code?: string; token?: string }>(req);
+    const headerToken = firstHeaderStr(req.headers['x-boltgate-session']);
+    const candidate = body.code ?? body.token ?? headerToken;
+    const sessionToken = manager.redeemPairingCredential(candidate);
+    if (!sessionToken) {
+      sendJson(res, 401, { error: 'Invalid or expired pairing code', requiresPairing: true });
+      return;
+    }
+    const capabilities = await manager.refreshCapabilities();
+    sendJson(res, 200, {
+      paired: true,
+      sessionToken,
+      apiVersion: capabilities.apiVersion ?? 4,
+      capabilities,
+    });
+    return;
+  }
 
   // Built-in deterministic benchmark file supporting HTTP Range / 206 Partial Content
   if (p === '/api/local-benchmark' && (method === 'GET' || method === 'HEAD')) {
@@ -96,8 +192,31 @@ async function handleApiRequest(
     return;
   }
 
+  // Enforce paired session token on all state, SSE, and action endpoints
+  const headerToken = firstHeaderStr(req.headers['x-boltgate-session']);
+  const queryToken = p === '/api/events' && method === 'GET' ? url.searchParams.get('session') : null;
+  if (!manager.verifySessionToken(headerToken ?? queryToken)) {
+    sendJson(res, 401, {
+      error: 'Companion pairing required',
+      requiresPairing: true,
+    });
+    return;
+  }
+
+  if (p === '/api/session/pairing-code' && method === 'POST') {
+    const issued = manager.issuePairingCode(5 * 60_000);
+    sendJson(res, 200, issued);
+    return;
+  }
+
   if (p === '/api/state' && method === 'GET') {
     sendJson(res, 200, manager.getSnapshot());
+    return;
+  }
+
+  if (p === '/api/capabilities' && method === 'GET') {
+    const capabilities = await manager.refreshCapabilities();
+    sendJson(res, 200, capabilities);
     return;
   }
 
@@ -112,16 +231,21 @@ async function handleApiRequest(
   }
 
   if (p === '/api/inspect' && method === 'POST') {
-    const body = await readJsonBody<{ text?: string; url?: string; destinationDir?: string }>(req);
+    const body = await readJsonBody<{
+      text?: string;
+      url?: string;
+      destinationDir?: string;
+      mode?: 'auto' | 'separate' | 'mirrors';
+    }>(req);
     const rawText = body.text ?? body.url ?? '';
     if (!rawText.trim()) {
-      sendJson(res, 400, { error: 'Paste one or more http(s) links to inspect' });
+      sendJson(res, 400, { error: 'Paste a URL, MD5 hash, magnet link, or mirror list to inspect' });
       return;
     }
-    const result = await manager.inspectRawText(rawText, body.destinationDir);
+    const result = await manager.inspectRawText(rawText, body.destinationDir, { mode: body.mode });
     if (result.items.length === 0) {
       sendJson(res, 400, {
-        error: 'No valid http:// or https:// URLs detected',
+        error: 'No valid http(s) URL, MD5 hash, IPFS URI, or magnet link detected',
         rejectedTokens: result.rejectedTokens,
       });
       return;
@@ -150,8 +274,21 @@ async function handleApiRequest(
   }
 
   if (p === '/api/downloads/approve-batch' && method === 'POST') {
-    const body = await readJsonBody<{ ids?: string[]; trustDomains?: boolean }>(req);
-    const items = await manager.approveBatch(body.ids ?? [], Boolean(body.trustDomains));
+    const body = await readJsonBody<{
+      ids?: string[];
+      entries?: Array<{
+        id: string;
+        filename?: string;
+        connections?: number;
+        engine?: 'node' | 'aria2';
+        selectFile?: string;
+        expectedSha256?: string;
+      }>;
+      trustDomains?: boolean;
+    }>(req);
+    // Per-row entries carry each row's own edits; plain ids remain supported for older UIs
+    const input = Array.isArray(body.entries) ? body.entries : Array.isArray(body.ids) ? body.ids : [];
+    const items = await manager.approveBatch(input, Boolean(body.trustDomains));
     sendJson(res, 200, { items });
     return;
   }
@@ -175,7 +312,7 @@ async function handleApiRequest(
       sendJson(res, 400, { error: 'Missing restore token' });
       return;
     }
-    const items = manager.restoreBatch(body.token);
+    const items = await manager.restoreBatch(body.token);
     sendJson(res, 200, { items });
     return;
   }
@@ -200,6 +337,9 @@ async function handleApiRequest(
         connections?: number;
         trustDomain?: boolean;
         startNow?: boolean;
+        engine?: 'node' | 'aria2';
+        selectFile?: string;
+        expectedSha256?: string;
       }>(req);
       const item = await manager.approveDownload(id, body);
       sendJson(res, 200, { item });
@@ -244,8 +384,8 @@ async function handleApiRequest(
     }
 
     if (action === 'verify-hash' && method === 'POST') {
-      const body = await readJsonBody<{ expectedSha256?: string }>(req);
-      const result = await manager.verifyHash(id, body.expectedSha256 ?? '');
+      const body = await readJsonBody<{ expectedHash?: string; expectedSha256?: string }>(req);
+      const result = await manager.verifyHash(id, body.expectedHash ?? body.expectedSha256 ?? '');
       sendJson(res, 200, result);
       return;
     }
@@ -267,14 +407,20 @@ async function handleApiRequest(
         await manager.openFile(id);
         sendJson(res, 200, { ok: true });
       } catch (err) {
-        sendJson(res, 403, { error: err instanceof Error ? err.message : String(err) });
+        sendJson(res, 403, { error: sanitizeUpstreamError(err, manager.getActiveSecrets(), 260) });
       }
       return;
     }
 
     if (action === 'restore' && method === 'POST') {
-      const item = manager.restoreDownload(id);
+      const item = await manager.restoreDownload(id);
       sendJson(res, 200, { item });
+      return;
+    }
+
+    if (action === 'redownload' && method === 'POST') {
+      const result = await manager.redownloadFromHistory(id);
+      sendJson(res, 200, result);
       return;
     }
   }
@@ -325,7 +471,8 @@ async function handleApiRequest(
     return;
   }
 
-  sendJson(res, 404, { error: `Unknown API route: ${method} ${p}` });
+  // Never echo the raw request pathname (it may carry ids, tokens, or pasted secrets)
+  sendJson(res, 404, { error: 'Unknown API route' });
 }
 
 async function serveLocalBenchmark(
@@ -380,7 +527,6 @@ async function serveLocalBenchmark(
     return;
   }
 
-  // Stream deterministic chunks cleanly with backpressure
   const chunkSize = 64 * 1024;
   let pos = start;
 
@@ -415,7 +561,9 @@ async function serveStaticFile(
   res: http.ServerResponse,
   requestPath: string,
   distDir: string,
-  headOnly: boolean
+  headOnly: boolean,
+  manager: DownloadManager,
+  allowPairingCodeInjection: boolean
 ): Promise<void> {
   const cleanPath = requestPath === '/' ? '/index.html' : requestPath;
   const candidate = path.resolve(distDir, `.${cleanPath}`);
@@ -435,12 +583,31 @@ async function serveStaticFile(
   }
 
   try {
-    const data = await fs.readFile(filePath);
+    let data = await fs.readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, {
+    const headers: Record<string, string | number> = {
       'Content-Type': MIME_TYPES[ext] ?? 'application/octet-stream',
-      'Content-Length': data.length,
-    });
+      'Cross-Origin-Resource-Policy': 'same-origin',
+    };
+
+    if (ext === '.html' && path.basename(filePath).toLowerCase() === 'index.html') {
+      headers['Cache-Control'] = 'no-store';
+      headers['X-Frame-Options'] = 'DENY';
+      headers['Content-Security-Policy'] = "frame-ancestors 'none'";
+      if (allowPairingCodeInjection && !headOnly) {
+        const { code } = manager.issuePairingCode(120_000);
+        const safeCode = escapeHtmlAttr(code);
+        const html = data.toString('utf8');
+        const metaTag = `<meta name="boltgate-pairing-code" content="${safeCode}" />`;
+        const injected = html.includes('</head>')
+          ? html.replace('</head>', `  ${metaTag}\n  </head>`)
+          : `${metaTag}\n${html}`;
+        data = Buffer.from(injected, 'utf8');
+      }
+    }
+
+    headers['Content-Length'] = data.length;
+    res.writeHead(200, headers);
     if (headOnly) {
       res.end();
     } else {
@@ -473,6 +640,35 @@ async function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
   }
 }
 
+function firstHeaderStr(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function isTrustedHostHeader(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  return /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i.test(hostHeader.trim());
+}
+
+function escapeHtmlAttr(value: string): string {
+  return value.replace(/[&"'<>]/g, (ch) => {
+    switch (ch) {
+      case '&':
+        return '&amp;';
+      case '"':
+        return '&quot;';
+      case "'":
+        return '&#39;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      default:
+        return ch;
+    }
+  });
+}
+
 function getAllowedCorsOrigin(origin: string): string | null {
   const trimmed = origin.trim();
   if (trimmed === 'https://eeeeee3434343423.github.io') {
@@ -490,8 +686,11 @@ function getAllowedCorsOrigin(origin: string): string | null {
   try {
     const parsed = new URL(trimmed);
     if (
+      parsed.origin === trimmed &&
+      !parsed.username &&
+      !parsed.password &&
       (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost')
+      (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]')
     ) {
       return parsed.origin;
     }

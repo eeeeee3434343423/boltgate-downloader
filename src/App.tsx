@@ -1,7 +1,16 @@
-import { Menu, RefreshCw, ShieldCheck, Terminal, Zap } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { KeyRound, Menu, RefreshCw, ShieldAlert, ShieldCheck, Terminal, Zap } from 'lucide-react';
+import { Component, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type CapabilityBinding,
+  CURRENT_API_VERSION,
+  isCapabilitiesVersionCurrent,
+  normalizeCapabilities,
+  normalizeSettings,
+  normalizeSnapshot,
+} from '../shared/compat';
+import { parseSmartInput } from '../shared/inputParser';
 import type { AppStateSnapshot, DownloadItem, TrustRule } from '../shared/types';
-import { api } from './api';
+import { PairingRequiredError, api } from './api';
 import { CompletedView } from './components/CompletedView';
 import { DownloadsView } from './components/DownloadsView';
 import { InspectDrawer } from './components/InspectDrawer';
@@ -12,18 +21,82 @@ import { Sidebar, type NavTab } from './components/Sidebar';
 import { Toast, type ToastNotice } from './components/Toast';
 import { TrustListView } from './components/TrustListView';
 
+class AppErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="workspace-content" style={{ maxWidth: 640, marginTop: 48 }}>
+          <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <ShieldAlert size={20} color="var(--danger)" aria-hidden="true" />
+              <h1 style={{ margin: 0, fontSize: 18 }}>BoltGate UI Recovered from Unexpected State</h1>
+            </div>
+            <p style={{ margin: 0, fontSize: 13.5, color: 'var(--text-muted)' }}>
+              {this.state.error.message || 'An unexpected rendering error occurred.'}
+            </p>
+            <div>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  this.setState({ error: null });
+                  window.location.reload();
+                }}
+              >
+                <RefreshCw size={15} aria-hidden="true" />
+                Reload Interface
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export function App() {
+  return (
+    <AppErrorBoundary>
+      <BoltGateWorkspace />
+    </AppErrorBoundary>
+  );
+}
+
+function BoltGateWorkspace() {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [pairingRequired, setPairingRequired] = useState(false);
+  const [pairingTokenInput, setPairingTokenInput] = useState('');
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [engineUrlError, setEngineUrlError] = useState<string | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
   const [activeTab, setActiveTab] = useState<NavTab>('gate');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [drawerItemId, setDrawerItemId] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastNotice | null>(null);
   const [engineUrlInput, setEngineUrlInput] = useState(() => api.getEngineBaseUrl() || 'http://127.0.0.1:3847');
+  // Origin + session the current snapshot (and its capability flags) was actually loaded from.
+  const [engineBinding, setEngineBinding] = useState<CapabilityBinding>(() => ({
+    origin: api.getEffectiveEngineOrigin(),
+    sessionToken: '',
+  }));
   const [connectAttempt, setConnectAttempt] = useState(0);
 
-  const pasteInputRef = useRef<HTMLInputElement | null>(null);
+  const pasteInputRef = useRef<HTMLTextAreaElement | null>(null);
   const toastTimerRef = useRef<number | null>(null);
 
   const showToast = useCallback(
@@ -44,109 +117,122 @@ export function App() {
     document.documentElement.setAttribute('data-theme', theme);
   }, [state?.settings.theme]);
 
-  // Initial load + SSE realtime subscription
+  // Initial load + SSE realtime subscription once authenticated
   useEffect(() => {
     let alive = true;
+    let disconnectSse: (() => void) | null = null;
     setLoadError(null);
+
     api
-      .getState()
-      .then((snap) => {
+      .getStateBound()
+      .then(({ snapshot: rawSnap, binding }) => {
         if (!alive) return;
+        const snap = normalizeSnapshot(rawSnap);
         setState(snap);
+        setEngineBinding(binding);
         setLoadError(null);
+        setPairingRequired(false);
+        setPairingError(null);
         if (snap.stats.pendingReviewCount === 0 && snap.stats.activeCount > 0) {
           setActiveTab('downloads');
         }
+
+        disconnectSse = api.connectEvents(
+          (ev) => {
+            setLoadError(null);
+            setState((prev) => {
+              if (ev.type === 'snapshot') return normalizeSnapshot(ev.data);
+              if (!prev) return prev;
+
+              if (ev.type === 'telemetry') {
+                const updates = new Map(ev.data.downloads.map((d) => [d.id, d]));
+                return {
+                  ...prev,
+                  downloads: prev.downloads.map((d) => updates.get(d.id) ?? d),
+                  speedHistory: ev.data.speedHistory,
+                  stats: ev.data.stats,
+                };
+              }
+
+              if (ev.type === 'download_updated') {
+                const exists = prev.downloads.some((d) => d.id === ev.data.id);
+                const nextDownloads = exists
+                  ? prev.downloads.map((d) => (d.id === ev.data.id ? ev.data : d))
+                  : [ev.data, ...prev.downloads];
+                return {
+                  ...prev,
+                  downloads: nextDownloads,
+                  stats: recomputeStats(nextDownloads),
+                };
+              }
+
+              if (ev.type === 'download_removed') {
+                const nextDownloads = prev.downloads.filter((d) => d.id !== ev.data.id);
+                return {
+                  ...prev,
+                  downloads: nextDownloads,
+                  stats: recomputeStats(nextDownloads),
+                };
+              }
+
+              if (ev.type === 'settings_updated') {
+                return {
+                  ...prev,
+                  settings: normalizeSettings(ev.data.settings, prev.settings.downloadDir),
+                  diskSpace: ev.data.diskSpace,
+                };
+              }
+
+              if (ev.type === 'trust_updated') {
+                return {
+                  ...prev,
+                  trustRules: ev.data,
+                };
+              }
+
+              return prev;
+            });
+          },
+          (connected) => setSseConnected(connected),
+          binding
+        );
       })
       .catch((err) => {
         if (!alive) return;
+        if (err instanceof PairingRequiredError) {
+          setPairingRequired(true);
+          setLoadError(null);
+          return;
+        }
+        setPairingRequired(false);
         setLoadError(err instanceof Error ? err.message : 'Failed to connect to BoltGate backend');
       });
 
-    const disconnect = api.connectEvents(
-      (ev) => {
-        setLoadError(null);
-        setState((prev) => {
-          if (ev.type === 'snapshot') return ev.data;
-          if (!prev) return prev;
-
-          if (ev.type === 'telemetry') {
-            const updates = new Map(ev.data.downloads.map((d) => [d.id, d]));
-            return {
-              ...prev,
-              downloads: prev.downloads.map((d) => updates.get(d.id) ?? d),
-              speedHistory: ev.data.speedHistory,
-              stats: ev.data.stats,
-            };
-          }
-
-          if (ev.type === 'download_updated') {
-            const exists = prev.downloads.some((d) => d.id === ev.data.id);
-            const nextDownloads = exists
-              ? prev.downloads.map((d) => (d.id === ev.data.id ? ev.data : d))
-              : [ev.data, ...prev.downloads];
-            return {
-              ...prev,
-              downloads: nextDownloads,
-              stats: recomputeStats(nextDownloads),
-            };
-          }
-
-          if (ev.type === 'download_removed') {
-            const nextDownloads = prev.downloads.filter((d) => d.id !== ev.data.id);
-            return {
-              ...prev,
-              downloads: nextDownloads,
-              stats: recomputeStats(nextDownloads),
-            };
-          }
-
-          if (ev.type === 'settings_updated') {
-            return {
-              ...prev,
-              settings: ev.data.settings,
-              diskSpace: ev.data.diskSpace,
-            };
-          }
-
-          if (ev.type === 'trust_updated') {
-            return {
-              ...prev,
-              trustRules: ev.data,
-            };
-          }
-
-          return prev;
-        });
-      },
-      (connected) => setSseConnected(connected)
-    );
-
     return () => {
       alive = false;
-      disconnect();
+      disconnectSse?.();
     };
   }, [connectAttempt]);
 
-  // Auto-retry every 3s while disconnected so launching Launch-BoltGate.bat connects automatically
+  // Auto-retry every 3s while disconnected (not while waiting on manual pairing token)
   useEffect(() => {
-    if (!loadError) return;
+    if (!loadError || pairingRequired) return;
     const timer = window.setInterval(() => {
       setConnectAttempt((n) => n + 1);
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [loadError]);
+  }, [loadError, pairingRequired]);
 
   // Global paste listener (when user presses Ctrl+V outside an input/textarea)
   const handleInspect = useCallback(
-    async (text: string, destinationDir?: string) => {
-      const res = await api.inspectLinks(text, destinationDir);
+    async (text: string, destinationDir?: string, mode?: 'auto' | 'separate' | 'mirrors') => {
+      const res = await api.inspectLinks(text, destinationDir, mode);
       if (res.items.length > 0) {
         setActiveTab('gate');
       }
       if (res.rejectedTokens.length > 0) {
         showToast(
-          `Inspected ${res.items.length} link(s); skipped ${res.rejectedTokens.length} unsupported scheme(s).`
+          `Inspected ${res.items.length} source(s); skipped ${res.rejectedTokens.length} unsupported token(s).`
         );
       }
     },
@@ -161,12 +247,24 @@ export function App() {
       }
       if (res.rejectedTokens.length > 0) {
         showToast(
-          `Inspected mirror group; skipped ${res.rejectedTokens.length} unsupported scheme(s).`
+          `Inspected mirror group; skipped ${res.rejectedTokens.length} unsupported token(s).`
         );
       }
     },
     [showToast]
   );
+
+  const refreshCapabilities = useCallback(async () => {
+    const { capabilities, binding } = await api.getCapabilitiesBound();
+    const caps = normalizeCapabilities(capabilities);
+    if (binding.origin !== engineBinding.origin || binding.sessionToken !== engineBinding.sessionToken) {
+      // Capabilities came from a different engine/session (e.g. another tab switched engines):
+      // never graft them onto this snapshot — reload everything bound to the active engine.
+      setConnectAttempt((n) => n + 1);
+      return;
+    }
+    setState((prev) => (prev ? { ...prev, capabilities: caps } : prev));
+  }, [engineBinding]);
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
@@ -180,10 +278,12 @@ export function App() {
         return;
       }
       const text = e.clipboardData?.getData('text/plain') ?? '';
-      if (/https?:\/\//i.test(text)) {
+      const parsed = parseSmartInput(text);
+      if (parsed.entries.length > 0) {
         e.preventDefault();
-        void handleInspect(text).catch((err) => {
-          showToast(err instanceof Error ? err.message : 'Failed to inspect pasted link', undefined, 'error');
+        const mode = parsed.hasMultiMirrors ? 'mirrors' : 'separate';
+        void handleInspect(text, undefined, mode).catch((err) => {
+          showToast(err instanceof Error ? err.message : 'Failed to inspect pasted input', undefined, 'error');
         });
       }
     };
@@ -217,6 +317,96 @@ export function App() {
     [state?.downloads, drawerItemId]
   );
 
+  if (pairingRequired) {
+    return (
+      <div className="workspace-content" style={{ maxWidth: 680, marginTop: 48 }}>
+        <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div className="brand-icon" aria-hidden="true">
+              <KeyRound size={18} />
+            </div>
+            <div>
+              <h1 style={{ margin: 0, fontSize: 19 }}>Pair Your Local BoltGate Companion</h1>
+              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+                This Companion requires a local Pairing Token so untrusted browser tabs cannot access your files, download history, or API credentials.
+              </div>
+            </div>
+          </div>
+
+          <form
+            style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setPairingBusy(true);
+              setPairingError(null);
+              try {
+                api.setEngineBaseUrl(engineUrlInput);
+                const res = await api.pairSession(pairingTokenInput);
+                if (res.paired) {
+                  setPairingTokenInput('');
+                  setPairingRequired(false);
+                  setConnectAttempt((n) => n + 1);
+                }
+              } catch (err) {
+                setPairingError(err instanceof Error ? err.message : 'Invalid pairing token');
+              } finally {
+                setPairingBusy(false);
+              }
+            }}
+          >
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <div className="field" style={{ flex: '1 1 220px' }}>
+                <label htmlFor="pair-engine-url" className="field-label">
+                  Local Engine Address
+                </label>
+                <input
+                  id="pair-engine-url"
+                  type="url"
+                  className="input mono"
+                  value={engineUrlInput}
+                  onChange={(e) => setEngineUrlInput(e.target.value)}
+                />
+              </div>
+              <div className="field" style={{ flex: '1 1 240px' }}>
+                <label htmlFor="pair-token-in" className="field-label">
+                  One-Time Pairing Code
+                </label>
+                <input
+                  id="pair-token-in"
+                  type="password"
+                  className="input mono"
+                  placeholder="Paste Pairing Code from Companion terminal"
+                  value={pairingTokenInput}
+                  onChange={(e) => setPairingTokenInput(e.target.value)}
+                />
+              </div>
+            </div>
+
+            {pairingError && (
+              <div style={{ fontSize: 12.5, color: 'var(--danger-text)', fontWeight: 600 }}>
+                {pairingError}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={pairingBusy || !pairingTokenInput.trim()}
+              >
+                <KeyRound size={15} aria-hidden="true" />
+                {pairingBusy ? 'Pairing…' : 'Pair & Connect'}
+              </button>
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Copy the one-time Pairing Code printed by <code className="mono">Launch-BoltGate.bat</code> (expires after 5 min; bound strictly to this loopback engine origin).
+              </span>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   if (loadError) {
     const remote = api.isRemoteHosted();
     return (
@@ -242,8 +432,15 @@ export function App() {
             style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}
             onSubmit={(e) => {
               e.preventDefault();
-              api.setEngineBaseUrl(engineUrlInput);
-              setConnectAttempt((n) => n + 1);
+              try {
+                const saved = api.setEngineBaseUrl(engineUrlInput);
+                setEngineUrlInput(saved);
+                setEngineUrlError(null);
+                setPairingTokenInput('');
+                setConnectAttempt((n) => n + 1);
+              } catch (err) {
+                setEngineUrlError(err instanceof Error ? err.message : 'Invalid loopback engine URL');
+              }
             }}
           >
             <div className="field" style={{ flex: '1 1 280px' }}>
@@ -262,6 +459,11 @@ export function App() {
               <RefreshCw size={15} aria-hidden="true" />
               Connect Now
             </button>
+            {engineUrlError && (
+              <div style={{ width: '100%', fontSize: 12.5, color: 'var(--danger-text)', fontWeight: 600 }}>
+                {engineUrlError}
+              </div>
+            )}
           </form>
 
           <div
@@ -362,21 +564,54 @@ export function App() {
 
         <PasteBar
           defaultDest={state.settings.downloadDir}
+          capabilities={state.capabilities}
           onInspect={handleInspect}
           onInspectMirrors={handleInspectMirrors}
           inputRef={pasteInputRef}
         />
 
         <main className="workspace-content">
+          {!isCapabilitiesVersionCurrent(state.capabilities) && (
+            <div
+              className="card"
+              role="status"
+              style={{
+                padding: '10px 14px',
+                borderColor: 'var(--warn)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}
+            >
+              <span style={{ fontSize: 13 }}>
+                <strong>Older Companion Engine Detected:</strong> Running API v
+                {state.capabilities.apiVersion ?? 1} (recommended v{CURRENT_API_VERSION}). Restart{' '}
+                <code className="mono">Launch-BoltGate.bat</code> to enable latest validator lock &amp; security features.
+              </span>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => void refreshCapabilities()}
+              >
+                <RefreshCw size={13} aria-hidden="true" />
+                Re-check
+              </button>
+            </div>
+          )}
+
           {activeTab === 'gate' && (
             <SafetyGateView
               items={gateItems}
+              capabilities={state.capabilities}
+              onRefreshCapabilities={refreshCapabilities}
               onApprove={async (id, opts) => {
                 await api.approveDownload(id, opts);
                 setActiveTab('downloads');
               }}
-              onApproveBatch={async (ids) => {
-                await api.approveBatch(ids, false);
+              onApproveBatch={async (entries) => {
+                await api.approveBatchEntries(entries, engineBinding, false);
                 setActiveTab('downloads');
               }}
               onReject={async (id, blockDomain) => {
@@ -439,8 +674,11 @@ export function App() {
                 }
               }}
               onVerifyHash={(id, expected) => api.verifyHash(id, expected)}
-              onRedownload={async (url) => {
-                await handleInspect(url);
+              onRedownload={async (id) => {
+                const res = await api.redownloadFromHistory(id);
+                if (res.items.length > 0) {
+                  setActiveTab('gate');
+                }
               }}
               onRemove={async (id, deleteFile) => {
                 const item = state.downloads.find((d) => d.id === id);
@@ -481,8 +719,15 @@ export function App() {
             <SettingsView
               settings={state.settings}
               diskSpace={state.diskSpace}
+              capabilities={state.capabilities}
+              pairedBinding={engineBinding}
+              capabilityBinding={engineBinding}
+              onRefreshCapabilities={refreshCapabilities}
               onUpdate={async (patch) => {
                 await api.updateSettings(patch);
+              }}
+              onUpdateSecret={async (patch, pinnedCtx) => {
+                await api.updateSecretSettings(patch, pinnedCtx);
               }}
             />
           )}

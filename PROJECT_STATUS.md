@@ -4,53 +4,34 @@
 **Workspace:** `C:\Users\jmrol\.gemini\antigravity\scratch\boltgate-downloader`  
 **GitHub Repo:** https://github.com/eeeeee3434343423/boltgate-downloader  
 **Live GitHub Pages UI:** https://eeeeee3434343423.github.io/boltgate-downloader/  
-**Local Engine Address:** `http://127.0.0.1:3847` (launch via `Launch-BoltGate.bat` or `npm start`)
+**Local Companion Engine Address:** `http://127.0.0.1:3847` (`Launch-BoltGate.bat` / `npm run companion` / `./companion/start.sh`)
 
 ---
 
 ## What's Going On Right Now
 
-BoltGate is built, tested (**13/13 automated tests passing**), pushed to GitHub (`main`), and deployed live on GitHub Pages.
-
-### How the Hybrid Architecture Works
-- **GitHub Pages (`https://eeeeee3434343423.github.io/boltgate-downloader/`)** hosts the static React UI (`dist/`).
-- **Your PC (`Launch-BoltGate.bat` / `http://127.0.0.1:3847`)** runs the local Node.js acceleration & safety engine so downloads bypass browser CORS restrictions, inspect TLS/headers/redirects before downloading, split into parallel streams, verify book formats, and write directly to disk.
-- **Important if you still had the earlier session open:** Stop any older running `Launch-BoltGate.bat` / `node` process on port `3847` and launch it again so your local backend picks up the Phase 3 updates (`POST /api/inspect-mirrors`, 128 KiB ebook segmenting, and Range-probe fix).
+BoltGate Phase 4 is built and verified: a **100% static GitHub Pages frontend (`dist/`)** paired with the **`/companion` local bridge** for smart multi-source resolution, concurrent candidate benchmarking, adaptive multi-mirror swarming, live 5-second speed-floor eviction, `.part.meta` crash resume, pre-rename MD5 verification, and optional `aria2c` P2P delegation.
 
 ---
 
 ## Timeline of Completed Updates
 
 ### Phase 1 — Core Downloader & Safety Gate
-- Built zero-payload Safety Gate (`server/inspector.ts`), multi-segment `FileHandle` positional writer + work-stealing (`server/engine.ts`), pause/resume persistence (`server/store.ts`), bandwidth limiter (`server/throttle.ts`), queue/trust/SHA-256 manager (`server/manager.ts`), and WCAG 2.2 AA React UI (`src/`).
-- Verified across desktop (`1280x800`), compact laptop (`1280x680`), and mobile (`390x844`) viewports; replaced compact native Settings checkboxes with `48x28 px` accessible switches.
+- Zero-payload Safety Gate (`server/inspector.ts`), multi-segment `FileHandle` positional writer + work-stealing (`server/engine.ts`), pause/resume persistence (`server/store.ts`), bandwidth limiter (`server/throttle.ts`), and WCAG 2.2 AA React UI (`src/`).
 
 ### Phase 2 — Digital Books Anti-Corruption & GitHub Pages Deployment
-- Added constant-memory file integrity checker (`server/verifier.ts`) validating PDF, EPUB, MOBI, AZW/AZW3, KFX, DJVU, CBZ, CBR, FB2, ZIP, RAR, 7z, and GZ structures and flagging HTML countdown/rate-limit pages saved under book extensions (`html_trap`).
-- Added **Digital Books (Anti-Corrupt)** preset (`1` concurrent download per mirror host, `3` global across hosts, `4` streams/file) and HTTP `429`/`503` `Retry-After` handling.
-- Added strict origin-allowlisted CORS + Private Network Access + CSRF protection (`server/app.ts`), offline **Connect Your Local BoltGate Engine** screen (`src/App.tsx`), and `.github/workflows/deploy-pages.yml`.
+- Constant-memory binary integrity checker (`server/verifier.ts`) for `.pdf`, `.epub`, `.mobi`, `.azw3`, `.djvu`, `.cbz`, `.cbr`, `.fb2`, `.zip`, `.rar`, `.7z`, `.gz` + HTML-trap detection.
+- **Digital Books (Anti-Corrupt)** preset (`1` concurrent/host, `3` global, `4` streams/file) + `429`/`503` `Retry-After` backoff + allowlisted CORS/PNA & GitHub Pages CI/CD.
 
-### Phase 3 — Multi-Mirror Striped Speed & Diagnostics (Latest, commit `a2d743a`)
-- **Range Probe Fix:** `HEAD 200` without `Accept-Ranges` now automatically probes `GET Range: bytes=0-0` while preserving `HEAD` headers (`Content-Disposition`, `ETag`, `Content-Type`).
-- **128 KiB Ebook Segmenting:** Lowered `DEFAULT_MIN_SEGMENT_BYTES` from `1 MiB` -> `128 KiB` so 1–10 MB books split across up to 16 parallel streams when servers support ranges.
-- **Multi-Mirror Striped Downloads (`POST /api/inspect-mirrors`):** In **Bulk Paste**, pasting 2+ mirrors for the same book lets you choose **`Same File — Combine Mirrors for Speed`**. BoltGate verifies matching exact byte sizes, stripes parallel byte ranges across all verified mirrors, steals slow tails onto the fastest active mirror, and immediately fails over if one mirror returns `429`/`503`.
-- **Speed Diagnostics:** Added live `< 512 KB/s` diagnostic notices in `DownloadsView.tsx` distinguishing single-stream servers from server-side mirror caps (such as Anna's Archive free Slow Partner Servers, which enforce server-side bandwidth caps that cannot be bypassed by any client).
+### Phase 3 — Multi-Mirror Striped Speed & Range Probe Fix
+- `HEAD 200` omitting `Accept-Ranges` falls back to `GET Range: bytes=0-0`; `128 KiB` minimum ebook segmenting; `POST /api/inspect-mirrors`.
 
----
-
-## Verification Snapshot
-
-- `npm run typecheck` — 0 errors
-- `npm run build` — `dist/` + `dist-server/` clean (`index.js` `309.41 kB` / `89.96 kB` gzip)
-- `npm test` — **13/13 tests passing** (`inspector.test.mjs`, `engine.test.mjs`, `verifier.test.mjs`, `api.test.mjs`)
-- GitHub Actions `Deploy BoltGate UI to GitHub Pages` (run `45740374109`) — succeeded
-- Live browser checks — verified both GitHub Pages **Bulk Paste -> Combine 2 Mirrors** UI and full end-to-end striped multi-mirror download (`6.00 MB` at `Avg 70.6 MB/s`, `Active Mirrors (2)`, `Parallel Segments (8)`).
-
----
-
-## Ideas for Parallel Chats / Next Improvements
-
-1. Add an in-app **Engine URL Switcher** in Settings (currently only shown on the offline Connect screen when `loadError` occurs) plus a 1-click Reset to `http://127.0.0.1:3847`.
-2. Add a **Live Speed Cap Quick-Toggle** in the sidebar telemetry card so users can throttle/unthrottle without leaving Downloads.
-3. Add a **Low Disk Space Pause Guard** that auto-pauses active downloads if free space drops below a configurable threshold.
-4. Add a **Download History Export** (JSON/CSV with SHA-256 and integrity audit results).
+### Phase 4 — Smart Input Parser, 4-Tier Book Resolver, Adaptive Swarming, Speed-Floor Switcher & `/companion` Bridge
+- **Smart Input Parser (`shared/inputParser.ts`, `PasteBar.tsx`):** Auto-growing multi-line bar accepts direct URLs, Anna's Archive `/md5/<hash>` links, raw 32-char MD5 hashes, multi-line mirrors, `magnet:?`, `.torrent` URLs, and `ipfs://` URIs.
+- **4-Tier Resolver & Candidate Benchmarking (`companion/resolver.ts`, `companion/benchmarker.ts`):**
+  - Tier 1 Fast Download API (`/dyn/api/fast_download.json`, key stored locally and redacted from all logs).
+  - Tier 2 configurable custom mirror templates (`{md5}`) + clean metadata/CID extraction (stops immediately on anti-bot/CAPTCHA challenges without bypassing).
+  - Tier 3 concurrent IPFS gateway race (local `127.0.0.1:8080` + public gateways) via `HEAD` + `Range: bytes=0-65535` throughput & HTML-trap probing.
+  - Tier 4 safe `aria2c` integration (`companion/aria2.ts`, `companion/torrentParser.ts`) with selective single-file torrent download (`--select-file`) and one-click OS install hint when `aria2c` is absent.
+- **Live 5s Speed-Floor Eviction, `.part.meta` & Pre-Rename MD5 (`server/engine.ts`, `companion/partMeta.ts`):** Evicts throttled mirrors under the configurable floor (`350 KB/s` default), hot-swaps unfinished byte ranges onto faster/standby mirrors, buffers `256 KiB` writes into pre-allocated `.part` files, recovers crashed transfers from `.part.meta`, and verifies MD5 before atomic rename.
+- **Transparent Live Telemetry (`DownloadsView.tsx`, `CompletedView.tsx`, `InspectDrawer.tsx`, `SettingsView.tsx`):** Shows active source badges, combined MB/s, active worker count, expandable per-source speed table + live routing log, and **`MD5 Verified`** badges.

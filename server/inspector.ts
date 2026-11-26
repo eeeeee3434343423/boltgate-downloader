@@ -11,6 +11,12 @@ import type {
   TrustRule,
 } from '../shared/types.js';
 import {
+  assertOutboundUrlSafe,
+  redactSensitiveUrl,
+  redactText,
+  sanitizeUpstreamError,
+} from '../companion/parser.js';
+import {
   checkMimeExtensionMismatch,
   classifyFile,
   extensionFromMime,
@@ -26,6 +32,7 @@ export interface ProbeOptions {
   existingDownloads: DownloadItem[];
   freeBytes?: number;
   timeoutMs?: number;
+  secrets?: readonly string[];
 }
 
 interface RawProbeResponse {
@@ -52,6 +59,7 @@ function singleRequest(
       headers: {
         'User-Agent': 'BoltGate/1.0 (+SafeDownloader)',
         Accept: '*/*',
+        'Accept-Encoding': 'identity',
         ...headers,
       },
       timeout: timeoutMs,
@@ -93,7 +101,9 @@ function singleRequest(
     req.on('timeout', () => {
       if (settled) return;
       settled = true;
-      req.destroy(new Error(`Connection timed out after ${timeoutMs}ms`));
+      const err = new Error(`Connection timed out after ${timeoutMs}ms`);
+      req.destroy(err);
+      reject(err);
     });
 
     req.on('error', (err) => {
@@ -121,13 +131,34 @@ function isTlsError(err: unknown): boolean {
   );
 }
 
-function parseContentRangeTotal(header?: string | string[]): number | null {
+function parseStrictZeroRangeHeader(
+  header?: string | string[],
+  contentLengthHeader?: string | string[]
+): { valid: boolean; total: number | null } {
   const val = Array.isArray(header) ? header[0] : header;
-  if (!val) return null;
-  const match = val.match(/bytes\s+\d+-\d+\/(\d+)/i);
-  if (!match || !match[1]) return null;
-  const n = Number(match[1]);
-  return Number.isFinite(n) && n >= 0 ? n : null;
+  if (!val) return { valid: false, total: null };
+  const match = val.trim().match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  if (!match) return { valid: false, total: null };
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === '*' ? null : Number(match[3]);
+  // For `Range: bytes=0-0`, require exact 0-0 span and a concrete positive total length
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start !== 0 ||
+    end !== 0 ||
+    total === null ||
+    !Number.isSafeInteger(total) ||
+    total <= 0
+  ) {
+    return { valid: false, total: null };
+  }
+  const declaredLen = parseContentLength(contentLengthHeader);
+  if (declaredLen !== null && declaredLen !== end - start + 1) {
+    return { valid: false, total: null };
+  }
+  return { valid: true, total };
 }
 
 function parseContentLength(header?: string | string[]): number | null {
@@ -148,9 +179,13 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
   let probeError: string | undefined;
   let tlsFailure: TlsInfo | undefined;
 
+  const secrets = options.secrets ?? [];
+
   const follow = async (startUrl: URL, method: 'HEAD' | 'GET', extraHeaders: Record<string, string>) => {
+    const hops: RedirectHop[] = [];
     let url = startUrl;
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      assertOutboundUrlSafe(url.toString(), secrets);
       const resp = await singleRequest(url, method, extraHeaders, timeoutMs);
       const isRedirect =
         resp.statusCode >= 300 && resp.statusCode < 400 && typeof resp.headers.location === 'string';
@@ -158,7 +193,7 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
         if (hop === MAX_REDIRECTS) {
           throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
         }
-        redirectChain.push({
+        hops.push({
           url: url.toString(),
           host: normalizeHostname(url.hostname),
           statusCode: resp.statusCode,
@@ -167,45 +202,57 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
         if (url.protocol !== 'http:' && url.protocol !== 'https:') {
           throw new Error(`Blocked unsafe redirect scheme: ${url.protocol}`);
         }
+        assertOutboundUrlSafe(url.toString(), secrets);
         continue;
       }
-      return { url, resp };
+      return { url, resp, hops };
     }
     throw new Error('Redirect limit exceeded');
   };
 
-  let headHeaders: http.IncomingHttpHeaders | undefined;
+  let headSucceeded = false;
+  let headRespHeaders: http.IncomingHttpHeaders | undefined;
+  let headRespTls: TlsInfo | undefined;
 
   try {
     const headResult = await follow(initialUrl, 'HEAD', {});
-    currentUrl = headResult.url;
-    finalResponse = headResult.resp;
-    headHeaders = headResult.resp.headers;
+    headSucceeded = headResult.resp.statusCode >= 200 && headResult.resp.statusCode < 300;
+    if (headSucceeded) {
+      currentUrl = headResult.url;
+      finalResponse = headResult.resp;
+      headRespHeaders = headResult.resp.headers;
+      headRespTls = headResult.resp.tls;
+      redirectChain.push(...headResult.hops);
+    }
 
-    const headAcceptRanges = String(finalResponse.headers['accept-ranges'] ?? '').toLowerCase();
+    const headAcceptRanges = String(headResult.resp.headers['accept-ranges'] ?? '').toLowerCase();
     const needsRangeProbe =
-      finalResponse.statusCode === 400 ||
-      finalResponse.statusCode === 403 ||
-      finalResponse.statusCode === 405 ||
-      finalResponse.statusCode === 501 ||
-      (finalResponse.statusCode >= 200 &&
-        finalResponse.statusCode < 300 &&
-        !headAcceptRanges.includes('bytes') &&
-        headAcceptRanges !== 'none');
+      !headSucceeded ||
+      (!headAcceptRanges.includes('bytes') && headAcceptRanges !== 'none');
 
     if (needsRangeProbe) {
       try {
-        const rangeResult = await follow(currentUrl, 'GET', { Range: 'bytes=0-0' });
-        if (rangeResult.resp.statusCode < 400 || finalResponse.statusCode >= 400) {
+        const rangeStartUrl = headSucceeded ? currentUrl : initialUrl;
+        const rangeResult = await follow(rangeStartUrl, 'GET', { Range: 'bytes=0-0' });
+        if (rangeResult.resp.statusCode < 400 || !headSucceeded) {
+          if (!headSucceeded) {
+            redirectChain.length = 0;
+            redirectChain.push(...rangeResult.hops);
+          } else {
+            redirectChain.push(...rangeResult.hops);
+          }
           currentUrl = rangeResult.url;
           finalResponse = rangeResult.resp;
         }
-      } catch {
-        // Keep HEAD result if fallback probe fails
+      } catch (rangeErr) {
+        // Keep HEAD result ONLY if HEAD succeeded; never restore failed HEAD metadata on fallback GET failure!
+        if (!headSucceeded) {
+          throw rangeErr;
+        }
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = sanitizeUpstreamError(err, secrets, 260);
     probeError = message;
     if (isTlsError(err)) {
       tlsFailure = { authorized: false, error: message };
@@ -217,35 +264,63 @@ export async function probeUrl(rawUrl: string, options: ProbeOptions): Promise<S
 
   const headers = finalResponse?.headers ?? {};
   const statusCode = finalResponse?.statusCode;
-  const contentType = firstStr(headers['content-type']) ?? firstStr(headHeaders?.['content-type']);
-  const etag = firstStr(headers.etag) ?? firstStr(headHeaders?.etag);
+  const rawEncoding = firstStr(headers['content-encoding'])?.trim().toLowerCase();
+  const isIdentityEncoding = !rawEncoding || rawEncoding === 'identity';
+
+  const headSameValidator =
+    headSucceeded &&
+    !(
+      headRespHeaders?.etag &&
+      headers.etag &&
+      firstStr(headRespHeaders.etag) !== firstStr(headers.etag)
+    );
+  const validHeadHeaders = headSameValidator ? headRespHeaders : undefined;
+  if (finalResponse && !finalResponse.tls && headSameValidator && headRespTls) {
+    finalResponse = { ...finalResponse, tls: headRespTls };
+  }
+
+  const contentType = firstStr(headers['content-type']) ?? firstStr(validHeadHeaders?.['content-type']);
+  const etag = firstStr(headers.etag) ?? firstStr(validHeadHeaders?.etag);
   const lastModified =
-    firstStr(headers['last-modified']) ?? firstStr(headHeaders?.['last-modified']);
+    firstStr(headers['last-modified']) ?? firstStr(validHeadHeaders?.['last-modified']);
   const contentDisposition =
-    firstStr(headers['content-disposition']) ?? firstStr(headHeaders?.['content-disposition']);
+    firstStr(headers['content-disposition']) ?? firstStr(validHeadHeaders?.['content-disposition']);
   const acceptRanges =
-    firstStr(headers['accept-ranges']) ?? firstStr(headHeaders?.['accept-ranges']);
+    firstStr(headers['accept-ranges']) ?? firstStr(validHeadHeaders?.['accept-ranges']);
 
   let totalBytes: number | null = null;
+  let valid206 = false;
   if (statusCode === 206) {
-    totalBytes =
-      parseContentRangeTotal(headers['content-range']) ??
-      parseContentLength(headHeaders?.['content-length']);
+    const cr = parseStrictZeroRangeHeader(headers['content-range'], headers['content-length']);
+    if (cr.valid && isIdentityEncoding) {
+      valid206 = true;
+      totalBytes = cr.total;
+    }
   } else if (statusCode && statusCode >= 200 && statusCode < 300) {
-    totalBytes =
-      parseContentLength(headers['content-length']) ??
-      parseContentLength(headHeaders?.['content-length']);
+    totalBytes = isIdentityEncoding
+      ? parseContentLength(headers['content-length']) ??
+        parseContentLength(validHeadHeaders?.['content-length'])
+      : null;
   }
 
   const supportsRanges =
-    statusCode === 206 || Boolean(acceptRanges && acceptRanges.toLowerCase().includes('bytes'));
+    valid206 ||
+    (isIdentityEncoding &&
+      Boolean(acceptRanges && acceptRanges.toLowerCase().includes('bytes')));
 
   const cdName = parseContentDispositionFilename(contentDisposition);
-  const urlPathName = decodeURIComponentSafe(currentUrl.pathname.split('/').filter(Boolean).pop() ?? '');
-  const initialPathName = decodeURIComponentSafe(
-    initialUrl.pathname.split('/').filter(Boolean).pop() ?? ''
-  );
-  const rawCandidate = cdName || urlPathName || initialPathName || 'download';
+  const safePathLast = (u: URL): string => {
+    try {
+      const redacted = new URL(redactSensitiveUrl(u.toString(), secrets));
+      const last = decodeURIComponentSafe(redacted.pathname.split('/').filter(Boolean).pop() ?? '');
+      return last === '***' ? '' : last;
+    } catch {
+      return '';
+    }
+  };
+  const urlPathName = safePathLast(currentUrl);
+  const initialPathName = safePathLast(initialUrl);
+  const rawCandidate = redactText(cdName || urlPathName || initialPathName || 'download', secrets);
   const fallbackExt = extensionFromMime(contentType);
   const suggestedFilename = sanitizeFilename(rawCandidate, fallbackExt);
 

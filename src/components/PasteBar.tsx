@@ -1,17 +1,43 @@
-import { AlertCircle, ClipboardPaste, Layers, Search, X } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import {
+  AlertCircle,
+  Check,
+  ClipboardPaste,
+  Copy,
+  Layers,
+  Search,
+  Sparkles,
+  X,
+} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { normalizeCapabilities } from '../../shared/compat';
+import { parseSmartInput } from '../../shared/inputParser';
+import type { CompanionCapabilities } from '../../shared/types';
 
 interface PasteBarProps {
   defaultDest: string;
-  onInspect: (text: string, destinationDir?: string) => Promise<void>;
+  capabilities: CompanionCapabilities;
+  onInspect: (
+    text: string,
+    destinationDir?: string,
+    mode?: 'auto' | 'separate' | 'mirrors'
+  ) => Promise<void>;
   onInspectMirrors?: (text: string, destinationDir?: string) => Promise<void>;
-  inputRef: React.RefObject<HTMLInputElement | null>;
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
 }
 
-export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }: PasteBarProps) {
+export function PasteBar({
+  defaultDest,
+  capabilities: rawCapabilities,
+  onInspect,
+  onInspectMirrors,
+  inputRef,
+}: PasteBarProps) {
+  const capabilities = normalizeCapabilities(rawCapabilities);
   const [urlText, setUrlText] = useState('');
+  const [quickMode, setQuickMode] = useState<'mirrors' | 'separate'>('mirrors');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [copiedHint, setCopiedHint] = useState(false);
 
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkText, setBulkText] = useState('');
@@ -20,10 +46,9 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
   const bulkTriggerRef = useRef<HTMLButtonElement | null>(null);
   const bulkTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const detectedBulkCount = useMemo(() => {
-    const matches = bulkText.match(/https?:\/\/[^\s<>"'`]+/gi) ?? [];
-    return new Set(matches.map((m) => m.trim())).size;
-  }, [bulkText]);
+  const quickParsed = useMemo(() => parseSmartInput(urlText), [urlText]);
+  const bulkParsed = useMemo(() => parseSmartInput(bulkText), [bulkText]);
+  const lineCount = useMemo(() => urlText.split(/\r?\n/).length, [urlText]);
 
   useEffect(() => {
     if (!bulkOpen) return;
@@ -39,21 +64,36 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [bulkOpen]);
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
+  const submitQuickText = async () => {
     if (!urlText.trim()) {
-      setErrorMsg('Paste one or more http:// or https:// links first.');
+      setErrorMsg('Paste a URL, MD5 hash, magnet link, IPFS URI, or mirror list first.');
       return;
     }
     setSubmitting(true);
     setErrorMsg(null);
     try {
-      await onInspect(urlText);
+      if (quickParsed.hasMultiMirrors && quickMode === 'mirrors' && onInspectMirrors) {
+        await onInspectMirrors(urlText);
+      } else {
+        await onInspect(urlText, undefined, quickParsed.hasMultiMirrors ? quickMode : 'auto');
+      }
       setUrlText('');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to inspect URL');
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to inspect input');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    await submitQuickText();
+  };
+
+  const handleTextareaKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void submitQuickText();
     }
   };
 
@@ -64,10 +104,10 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
     setErrorMsg(null);
     try {
       const dest = bulkDest.trim() || undefined;
-      if (bulkMode === 'mirrors' && detectedBulkCount >= 2 && onInspectMirrors) {
+      if (bulkMode === 'mirrors' && bulkParsed.directUrls.length >= 2 && onInspectMirrors) {
         await onInspectMirrors(bulkText, dest);
       } else {
-        await onInspect(bulkText, dest);
+        await onInspect(bulkText, dest, 'separate');
       }
       setBulkText('');
       setBulkDest('');
@@ -81,6 +121,13 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
     }
   };
 
+  const hasP2PEntry = quickParsed.entries.some(
+    (e) => e.kind === 'magnet' || e.kind === 'torrent_url'
+  );
+  const hasMd5Entry = quickParsed.entries.some(
+    (e) => e.kind === 'annas_md5' || e.kind === 'raw_md5'
+  );
+
   return (
     <>
       <header className="paste-header">
@@ -88,26 +135,27 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
           <div className="paste-input-wrap">
             <Search size={16} className="paste-icon" aria-hidden="true" />
             <label htmlFor="quick-paste-input" className="sr-only">
-              Paste download URL or links to inspect
+              Paste URL, Anna&apos;s Archive link or MD5 hash, multi-line mirrors, magnet, or .torrent link
             </label>
-            <input
+            <textarea
               id="quick-paste-input"
               ref={inputRef}
-              type="text"
-              className="paste-input"
+              rows={Math.min(5, Math.max(1, lineCount))}
+              className="paste-input paste-textarea"
               value={urlText}
               onChange={(e) => {
                 setUrlText(e.target.value);
                 if (errorMsg) setErrorMsg(null);
               }}
-              placeholder="Paste a link (or Ctrl+V anywhere) to inspect before downloading…"
+              onKeyDown={handleTextareaKeyDown}
+              placeholder="Paste URL, Anna’s Archive link or 32-char MD5, multi-line mirrors, magnet:?, .torrent, or ipfs://…"
             />
           </div>
 
           <div className="paste-actions">
             <button type="submit" className="btn btn-primary" disabled={submitting}>
               <ClipboardPaste size={15} aria-hidden="true" />
-              {submitting ? 'Probing…' : 'Inspect & Check'}
+              {submitting ? 'Resolving…' : 'Inspect & Resolve'}
             </button>
             <button
               ref={bulkTriggerRef}
@@ -120,6 +168,70 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
             </button>
           </div>
         </form>
+
+        {quickParsed.entries.length > 0 && (
+          <div className="smart-detect-bar">
+            <span className="badge badge-info">
+              <Sparkles size={12} aria-hidden="true" />
+              {quickParsed.summaryLabel}
+            </span>
+
+            {hasMd5Entry && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Companion will race Fast API, custom mirrors &amp; IPFS gateways automatically.
+              </span>
+            )}
+
+            {quickParsed.hasMultiMirrors && (
+              <div className="pill-tabs" role="radiogroup" aria-label="Multiple mirror handling">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={quickMode === 'mirrors'}
+                  className={`pill-tab ${quickMode === 'mirrors' ? 'active' : ''}`}
+                  onClick={() => setQuickMode('mirrors')}
+                >
+                  Combine Mirrors (Speed)
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={quickMode === 'separate'}
+                  className={`pill-tab ${quickMode === 'separate' ? 'active' : ''}`}
+                  onClick={() => setQuickMode('separate')}
+                >
+                  Separate Files
+                </button>
+              </div>
+            )}
+
+            {hasP2PEntry && (
+              capabilities.aria2Available ? (
+                <span className="badge badge-ok">
+                  aria2c v{capabilities.aria2Version} Ready
+                </span>
+              ) : (
+                <span className="badge badge-warn">
+                  aria2c not found — install with{' '}
+                  <code className="mono">{capabilities.installHint.command}</code>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-icon"
+                    style={{ minHeight: 24, minWidth: 24, padding: '2px 6px' }}
+                    aria-label="Copy aria2c install command"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(capabilities.installHint.command);
+                      setCopiedHint(true);
+                      setTimeout(() => setCopiedHint(false), 1800);
+                    }}
+                  >
+                    {copiedHint ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
+                  </button>
+                </span>
+              )
+            )}
+          </div>
+        )}
 
         {errorMsg && (
           <div className="paste-feedback" role="alert">
@@ -149,10 +261,10 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
             <div className="modal-header">
               <div>
                 <h2 id="bulk-modal-title" style={{ margin: 0, fontSize: 16 }}>
-                  Bulk Paste Links for Safety Inspection
+                  Bulk Paste Links, MD5 Hashes &amp; Mirrors
                 </h2>
                 <div style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
-                  Paste any text, list of URLs, or release notes — BoltGate extracts valid links and checks every one before downloading.
+                  Supports direct URLs, Anna&apos;s Archive /md5/ links, raw 32-char MD5 hashes, magnets, .torrent links, and IPFS URIs.
                 </div>
               </div>
               <button
@@ -173,9 +285,11 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
                 <div className="field">
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <label htmlFor="bulk-urls-textarea" className="field-label">
-                      Links or Text
+                      Sources or Text
                     </label>
-                    <span className="badge badge-info num">{detectedBulkCount} URLs detected</span>
+                    <span className="badge badge-info num">
+                      {bulkParsed.entries.length} source{bulkParsed.entries.length === 1 ? '' : 's'} detected
+                    </span>
                   </div>
                   <textarea
                     id="bulk-urls-textarea"
@@ -183,14 +297,16 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
                     className="textarea"
                     value={bulkText}
                     onChange={(e) => setBulkText(e.target.value)}
-                    placeholder={'https://example.com/archive-part1.zip\nhttps://example.com/archive-part2.zip'}
+                    placeholder={
+                      'https://annas-archive.org/md5/0123456789abcdef0123456789abcdef\nhttps://mirror1.example.com/book.epub\nhttps://mirror2.example.com/book.epub'
+                    }
                   />
                 </div>
 
-                {detectedBulkCount >= 2 && onInspectMirrors && (
+                {bulkParsed.directUrls.length >= 2 && onInspectMirrors && (
                   <div className="field">
                     <span id="bulk-mode-label" className="field-label">
-                      How should these {detectedBulkCount} links download?
+                      How should these {bulkParsed.directUrls.length} direct URLs download?
                     </span>
                     <div
                       className="pill-tabs"
@@ -216,12 +332,12 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
                         style={{ flex: 1 }}
                         onClick={() => setBulkMode('mirrors')}
                       >
-                        Same File — Combine Mirrors for Speed
+                        Same File — Swarm Mirrors for Speed
                       </button>
                     </div>
                     <span className="field-help">
                       {bulkMode === 'mirrors'
-                        ? 'Verifies matching file sizes across mirrors and stripes parallel byte ranges across all healthy hosts simultaneously.'
+                        ? 'Verifies matching file sizes across mirrors and swarms parallel byte ranges across all healthy hosts with live speed-floor switching.'
                         : 'Inspects and downloads each URL as its own file using polite per-host queue limits.'}
                     </span>
                   </div>
@@ -256,11 +372,11 @@ export function PasteBar({ defaultDest, onInspect, onInspectMirrors, inputRef }:
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={submitting || detectedBulkCount === 0}
+                  disabled={submitting || bulkParsed.entries.length === 0}
                 >
-                  {bulkMode === 'mirrors' && detectedBulkCount >= 2
-                    ? `Combine ${detectedBulkCount} Mirrors`
-                    : `Inspect ${detectedBulkCount || ''} Link${detectedBulkCount === 1 ? '' : 's'}`}
+                  {bulkMode === 'mirrors' && bulkParsed.directUrls.length >= 2
+                    ? `Swarm ${bulkParsed.directUrls.length} Mirrors`
+                    : `Inspect ${bulkParsed.entries.length || ''} Source${bulkParsed.entries.length === 1 ? '' : 's'}`}
                 </button>
               </div>
             </form>
